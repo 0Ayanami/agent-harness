@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-harness"
+version = "0.1.0"
+description = "A composed local agent runtime with CLI and web interfaces"
+requires-python = ">=3.11"
+dependencies = [
+  "anthropic>=0.25.0",
+  "python-dotenv>=1.0.0",
+  "pyyaml>=6.0",
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "httpx>=0.27,<1", "ruff>=0.9,<1"]
+browser = ["playwright>=1.49,<2"]
+
+[project.scripts]
+agent-harness = "agent_harness.__main__:main"
+
+[tool.setuptools]
+include-package-data = false
+packages = [
+  "agent_harness", "agent_harness.application", "agent_harness.core",
+  "agent_harness.infrastructure", "agent_harness.interfaces",
+  "agent_harness.interfaces.web", "agent_harness.services", "agent_harness.tools",
+]
+
+[tool.setuptools.package-dir]
+agent_harness = "."
+
+[tool.setuptools.package-data]
+agent_harness = [
+  "frontend/package*.json", "frontend/*.ts", "frontend/*.mjs", "frontend/*.md",
+  "frontend/src/**/*.ts", "frontend/src/**/*.tsx", "frontend/src/**/*.css",
+  "frontend/src/**/*.json", "frontend/src/**/*.ico", "frontend/out/**/*",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["..", "tests"]

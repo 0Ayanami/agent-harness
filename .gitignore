@@ -1,0 +1,22 @@
+.test-tmp*/
+.test-artifacts/
+.pytest_cache/
+__pycache__/
+build/
+dist/
+*.egg-info/
+.ruff_cache/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/tsconfig.tsbuildinfo
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
