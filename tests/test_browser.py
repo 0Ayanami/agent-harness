@@ -55,8 +55,8 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
     thread = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
     thread.start()
     wait_until(lambda: server.started, timeout=10)
-    artifacts = Path(__file__).parents[1] / ".test-artifacts"
-    artifacts.mkdir(exist_ok=True)
+    artifacts = Path(__file__).parents[1] / ".artifacts" / "test-results" / "browser"
+    artifacts.mkdir(parents=True, exist_ok=True)
     errors = []
     try:
         with browser_api.sync_playwright() as playwright:

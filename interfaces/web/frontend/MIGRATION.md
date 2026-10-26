@@ -2,15 +2,16 @@
 
 The executable workbench is a small migration of the existing `web/` teaching
 site. The original site, its chapter pages, generated course data, simulations,
-and extraction pipeline remain untouched. This directory uses the same Next.js,
+and extraction pipeline were not copied into this standalone repository. This directory uses the same Next.js,
 React, Tailwind, icons, and motion packages already selected by that site.
 
 ## Source map
 
-Paths below are relative to the repository root. Files marked "unchanged" are
+Source paths below refer to the original teaching repository; destination paths
+are relative to this repository's `interfaces/web/frontend/`. Files marked "unchanged" are
 copied exactly; adapted components retain the existing rendering implementation.
 
-| Source in `web/` | Destination in `agent_harness/frontend/` | Changes |
+| Source in original `web/` | Destination in `interfaces/web/frontend/` | Changes |
 | --- | --- | --- |
 | `src/app/globals.css` | `src/app/globals.css` | Unchanged theme, colors, responsive rules, documentation and code styles. |
 | `src/components/ui/card.tsx` | same relative path | Unchanged. |
@@ -25,9 +26,10 @@ copied exactly; adapted components retain the existing rendering implementation.
 | `src/i18n/messages/{en,zh,ja}.json` | same relative paths | Unchanged teaching dictionaries. |
 | `src/types/agent-data.ts` | same relative path | Unchanged component types. |
 | `src/app/[locale]/layout.tsx` | same relative path | Retains locale provider, header, main shell, and local theme initialization. Metadata describes the runtime workbench. |
-| `src/app/page.tsx` | same relative path | Retains redirect pattern; Chinese is the default locale. |
+| `src/app/page.tsx` | `src/app/(entry)/page.tsx` | Retains the default Chinese redirect; the entry route has its own root layout for webpack builds. |
 | `src/app/favicon.ico` | same relative path | Unchanged original site favicon. |
-| `tsconfig.json`, `postcss.config.mjs` | same relative paths | Unchanged. |
+| `tsconfig.json` | same relative path | Preserves compiler options; stores incremental state in the repository's `.artifacts/cache/typescript/` directory. |
+| `postcss.config.mjs` | same relative path | Unchanged. |
 | `next.config.ts` | same relative path | Retains production static export. Development adds the Python API proxy. |
 | `package.json` | `package.json` | Keeps required original dependencies, excludes course extraction and unused document/diagram packages. |
 
@@ -50,22 +52,43 @@ events, so approvals resolved or discarded by a service restart are not revived.
 
 ## Running and configuration
 
+The Next.js project now lives in `interfaces/web/frontend/`, alongside the
+Python HTTP/SSE adapter (`app.py`) and web host (`host.py`). The CLI remains in
+`interfaces/cli.py`; `scripts/project.ps1` manages the entire repository.
+
 Install the migrated frontend dependencies once:
 
 ```powershell
-npm --prefix agent_harness/frontend install
+.\scripts\project.ps1 deps
 ```
+
+On this Windows machine, this delegates to `install-deps.ps1`, which keeps this
+project's packages at `D:\nvm\project-deps\agent-harness\node_modules` and
+exposes them through a `node_modules` directory junction here. `package.json`
+and `package-lock.json` in this source directory remain authoritative. Run
+`.\interfaces\web\frontend\install-deps.ps1 -Refresh` from the repository root
+to reinstall after changing the lockfile. Do not run a plain `npm install` or
+`npm ci` in the source directory after setting up the junction: those commands
+can replace it and recreate local packages. Running the npm scripts below is
+supported; development and build scripts use webpack for external junction
+compatibility. Node.js and npm themselves remain managed separately from these
+project dependencies. Other machines may use a conventional local installation.
 
 Production preserves the original static export workflow:
 
 ```powershell
-npm --prefix agent_harness/frontend run build
+$env:NEXT_TELEMETRY_DISABLED = '1'
+npm --prefix interfaces/web/frontend run build
 . .\.venv\Scripts\Activate.ps1
 python -m agent_harness
 ```
 
-The Python web server serves `frontend/out` and the live API together. There is
+The Python web server serves `interfaces/web/frontend/out` and the live API together. There is
 no `next start` command because the production frontend is a static export.
+`out/` contains this project's generated pages and browser assets, so it stays
+with the application. It is not a library installation or an npm cache. Once
+it has been built, the default Python static mode needs neither Node.js nor
+`node_modules`; rebuilding and frontend development still require them.
 
 For frontend development, start the Python API then run Next.js with a port:
 
@@ -77,7 +100,7 @@ In another shell, run:
 
 ```powershell
 $env:AGENT_API_URL = 'http://127.0.0.1:8000'
-npm --prefix agent_harness/frontend run dev -- --port 3000
+npm --prefix interfaces/web/frontend run dev -- --port 3000
 ```
 
 All browser requests use `/api/agent/*`. Development rewrites proxy them to
@@ -111,4 +134,5 @@ defaults, matching the original UI; no remote font download is required.
 | Tool call count | `#tool-count` |
 | Composer | `#composer` |
 
-The original teaching page components remain independently runnable from `web/`.
+The original teaching page components belong to the original repository's `web/`,
+which is not included in this standalone repository.

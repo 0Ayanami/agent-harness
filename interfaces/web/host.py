@@ -9,7 +9,7 @@ from ...infrastructure.platform import stop_process_group
 
 
 def frontend_directory() -> Path:
-    return Path(__file__).resolve().parents[2] / "frontend"
+    return Path(__file__).resolve().parent / "frontend"
 
 
 def frontend_command(port: int) -> tuple[list[str], Path]:
@@ -19,13 +19,12 @@ def frontend_command(port: int) -> tuple[list[str], Path]:
     if node is None:
         raise RuntimeError("Node.js is required by the migrated web frontend")
     if not executable.is_file():
-        raise RuntimeError(
-            "Install frontend dependencies first: npm --prefix agent_harness/frontend ci"
-        )
+        raise RuntimeError("Install frontend dependencies first: .\\scripts\\project.ps1 deps")
     return [
         node,
         str(executable),
         "dev",
+        "--webpack",
         "--hostname",
         "127.0.0.1",
         "--port",
@@ -41,7 +40,8 @@ def serve_web(config, client_factory, *, api_port=8000, web_port=3000, developme
         output = frontend_directory() / "out"
         if not (output / "index.html").is_file():
             raise RuntimeError(
-                "Build the migrated frontend first: npm --prefix agent_harness/frontend ci; npm --prefix agent_harness/frontend run build"
+                "Build the migrated frontend first: .\\scripts\\project.ps1 deps; "
+                ".\\scripts\\project.ps1 build"
             )
         print(f"Agent workspace: http://127.0.0.1:{api_port}", flush=True)
         uvicorn.run(

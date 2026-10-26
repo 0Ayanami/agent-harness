@@ -1,13 +1,14 @@
+.artifacts/
 .test-tmp*/
 .test-artifacts/
 .pytest_cache/
 __pycache__/
 *.egg-info/
 .ruff_cache/
-frontend/node_modules/
-frontend/.next/
-frontend/out/
-frontend/tsconfig.tsbuildinfo
+interfaces/web/frontend/node_modules/
+interfaces/web/frontend/.next/
+interfaces/web/frontend/out/
+interfaces/web/frontend/tsconfig.tsbuildinfo
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

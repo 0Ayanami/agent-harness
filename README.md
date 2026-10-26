@@ -1,24 +1,26 @@
 # Agent Harness 应用
 
-这是独立的 agent 应用工程，原有 `s01_*` 到 `s17_*`、`agents/`、`web/` 和教学测试保持不变。
+这是从教学工程中独立出来的 agent 应用。本仓库根目录就是应用目录，Python 包名为 `agent_harness`；原教学工程的 `s01_*` 到 `s17_*`、`agents/` 和 `web/` 不在当前仓库中。
 
 本版把已有能力组织为组合式运行时，网页从原有 `web/` 的 Next.js 工程迁移：沿用原站的布局、配色、主题切换、多语言、UI 和模拟器消息组件，将消息来源接入实际 agent。主循环、子 agent、记忆、任务、团队、上下文压缩、后台任务、cron 和模拟 MCP 能力沿用现有项目的算法。没有实现文档入库、向量检索或 RAG 知识库。
 
 ## 启动网页
 
-从仓库根目录执行：
+从当前仓库根目录执行。已有 `.venv` 时可以直接激活；首次搭建且没有虚拟环境时，先执行 `uv venv --python 3.13 .venv`。依赖要求 Python 3.11 及以上，当前前端要求 Node.js 20.9.0 及以上。
 
 ```powershell
+Set-Location D:\research\agent-harness
 . .\.venv\Scripts\Activate.ps1
-uv pip install --python .venv\Scripts\python.exe -e agent_harness
-npm --prefix agent_harness/frontend ci
-npm --prefix agent_harness/frontend run build
-python -m agent_harness
+uv sync --frozen
+.\scripts\project.ps1 deps
+$env:NEXT_TELEMETRY_DISABLED = '1'
+npm --prefix interfaces/web/frontend run build
+.\scripts\project.ps1 run
 ```
 
-打开 **http://127.0.0.1:8000**。首次安装和修改前端后需要用 Node.js 构建；沿用原站的静态导出模式，构建后由 Python 同源提供页面、资源、API 和 SSE，日常运行只需 `python -m agent_harness`。安装后也可以使用 `agent-harness` 命令。原有教学站点使用自己的启动方式。
+打开 **http://127.0.0.1:8000/zh/**。首次安装和修改前端后需要用 Node.js 构建；沿用原站的静态导出模式，构建后由 Python 同源提供页面、资源、API 和 SSE。日常执行 `.\scripts\project.ps1 run` 即可，无需手动激活虚拟环境。手动激活后使用 `python -m agent_harness` 或 `agent-harness` 也仍然支持。
 
-沿用仓库根目录 `.env` 的 `MODEL_ID`、`ANTHROPIC_API_KEY`，以及可选的 `ANTHROPIC_BASE_URL`、`FALLBACK_MODEL_ID`。密钥保留在 Python 后端，不发送给浏览器。改变端口或工作区：
+启动前配置仓库根目录 `.env` 的 `MODEL_ID`、`ANTHROPIC_API_KEY`，以及可选的 `ANTHROPIC_BASE_URL`、`FALLBACK_MODEL_ID`。没有 `.env` 时才执行 `Copy-Item .env.example .env`，再填写真实配置。模型接口使用 Anthropic Messages 协议，第三方服务需要支持该协议，不能直接填入仅支持 OpenAI 协议的地址。密钥保留在 Python 后端，不发送给浏览器。改变端口或工作区：
 
 ```powershell
 python -m agent_harness web --port 8080 --workdir D:\path\to\project
@@ -26,16 +28,18 @@ python -m agent_harness cli
 python -m agent_harness api
 ```
 
-也支持直接安装 Python 依赖后从仓库根目录运行，前端仍需完成上述安装和构建：
+不使用 uv 时，也可以在已包含 pip 的虚拟环境中安装当前包；前端仍需完成上述安装和构建：
 
 ```powershell
-uv pip install --python .venv\Scripts\python.exe -r agent_harness\requirements.txt
+python -m pip install -e .
 python -m agent_harness
 ```
 
 网页支持新建和切换会话、连续对话、查看工具调用与输出、命令权限确认、停止执行，以及查看任务看板和项目记忆。刷新网页会恢复对话、运行状态和等待确认的操作。权限确认在网页内完成，不依赖后端终端输入。
 
-原有 `web/` 是章节学习与模拟器，文件保持原样。迁移副本位于 `agent_harness/frontend/`，侧栏保留原章节分组与教学链接，新增会话入口；原模拟器的 `SimulatorMessage` 用于呈现真实对话和工具事件。课程场景与课程生成数据没有复制到运行包。迁移来源与适配范围见 `frontend/MIGRATION.md`。
+`interfaces/web/frontend/` 来自原教学工程的网页，侧栏保留原章节分组与教学链接，新增会话入口；原模拟器的 `SimulatorMessage` 用于呈现真实对话和工具事件。课程场景与课程生成数据没有复制到运行包。迁移来源与适配范围见 `interfaces/web/frontend/MIGRATION.md`。
+
+完整启动排错、当前架构、知识库开发方向与学习顺序见 [项目导读与运行手册](docs/project-guide.zh-CN.md)。`docs/zh/` 和现有面试问答保留了原教学仓库背景，其中的旧启动命令和源码路径不能直接用于当前仓库。
 
 开发前端时可运行：
 
@@ -48,16 +52,10 @@ python -m agent_harness --dev
 ## 工程结构
 
 ```text
-agent_harness/
+agent-harness/                 # 仓库目录；安装后的 Python 包名是 agent_harness
 ├── pyproject.toml              # 可安装包、依赖、入口、测试与格式配置
 ├── config.py                   # 配置；只在启动入口加载 .env
 ├── __main__.py                 # web / api / cli 启动选择
-├── frontend/                   # 从原 web 迁移的 Next.js 工程
-│   ├── src/components/         # 原布局、UI、消息组件及运行适配
-│   ├── src/hooks/              # 真实会话 / SSE 连接
-│   ├── src/i18n/               # 原多语言内容及运行页面翻译
-│   ├── next.config.ts          # dev 代理 / production 静态导出
-│   └── out/                    # 导出产物（构建生成，不提交 Git）
 ├── core/
 │   ├── engine.py               # 可复用模型 / 工具循环
 │   ├── ports.py                # 模型、上下文、工具执行接口
@@ -96,9 +94,20 @@ agent_harness/
 │   ├── cli.py                 # 终端输入与展示
 │   └── web/
 │       ├── app.py             # HTTP 与 SSE；不实现 agent 业务逻辑
-│       └── host.py            # 托管迁移产物，或管理开发服务器
+│       ├── host.py            # 托管静态产物，或管理开发服务器
+│       └── frontend/          # 从原 web 迁移的 Next.js 工程
+│           ├── src/components/ # 布局、UI、消息组件及运行适配
+│           ├── src/hooks/     # 真实会话 / SSE 连接
+│           ├── src/i18n/      # 多语言内容及运行页面翻译
+│           ├── install-deps.ps1 # 项目依赖外置安装与联接管理
+│           ├── next.config.ts # dev 代理 / production 静态导出
+│           ├── node_modules/  # 联接到仓库外的项目专属依赖
+│           └── out/           # 导出产物（构建生成，不提交 Git）
+├── scripts/project.ps1        # 全项目启动、测试、检查、构建和清理
 └── tests/                     # 服务、HTTP、SSE 与真实浏览器检查
 ```
+
+Web 页面源码、HTTP / SSE 接口和托管入口统一在 `interfaces/web/`。`interfaces/cli.py` 是终端入口；`scripts/project.ps1` 管理 Python 与前端的整套工程，因此保留在根目录的 `scripts/`。
 
 ## 整合与分离的依据
 
@@ -170,15 +179,36 @@ HTTP 提交立即返回 `202`，执行进入会话的工作线程。SSE 按事�
 
 ```powershell
 . .\.venv\Scripts\Activate.ps1
-uv pip install --python .venv\Scripts\python.exe -e 'agent_harness[test,browser]'
-npm --prefix agent_harness/frontend ci
-npm --prefix agent_harness/frontend run typecheck
-npm --prefix agent_harness/frontend run build
-python -m pytest agent_harness\tests -q --basetemp=agent_harness/.test-tmp
-python -m ruff check agent_harness --select F
-python -m ruff format --check agent_harness
+uv sync --frozen --extra test --extra browser
+.\scripts\project.ps1 deps
+npm --prefix interfaces/web/frontend run typecheck
+$env:NEXT_TELEMETRY_DISABLED = '1'
+npm --prefix interfaces/web/frontend run build
+python -m pytest tests -q
+python -m ruff check application core infrastructure interfaces services tools tests config.py __init__.py __main__.py --select F
+python -m ruff format --check application core infrastructure interfaces services tools tests config.py __init__.py __main__.py
 ```
 
 普通测试使用模型替身，验证实际工具、存储、任务、团队协议、后台执行、HTTP、SSE、审批、并发拒绝、取消与恢复。浏览器测试启动真实本地服务器，用无界面 Edge 完成对话、权限确认、刷新恢复和移动端布局检查；其他平台可设置 `HARNESS_BROWSER_EXECUTABLE` 指向已安装的 Chromium 浏览器，没有可用浏览器时跳过该项。测试不会调用在线模型 API。
+
+## 过程文件管理
+
+测试临时文件、pytest / Ruff / TypeScript 缓存及浏览器截图集中在 `.artifacts/`，已加入 Git 忽略。使用管理脚本运行时还会禁止生成源码旁的 `__pycache__`：
+
+```powershell
+.\scripts\project.ps1 run     # 日常启动，无需手动激活虚拟环境
+.\scripts\project.ps1 deps    # 将前端依赖放在仓库外并建立联接
+.\scripts\project.ps1 dev     # 前端开发模式
+.\scripts\project.ps1 test    # 测试
+.\scripts\project.ps1 check   # Python 静态检查与前端类型检查
+.\scripts\project.ps1 build   # 前端构建
+.\scripts\project.ps1 clean   # 清理可重建产物及旧路径残留
+```
+
+清理会保留 `.venv/`、`interfaces/web/frontend/node_modules/`、`interfaces/web/frontend/out/` 和 `.runtime/` / `.memory/` 等运行数据。Next.js 的 `.next/` 沿用框架路径，清理时可删除；静态页面 `interfaces/web/frontend/out/` 是默认启动所需文件，不能随缓存一起删除。完整目录说明见 [项目导读](docs/project-guide.zh-CN.md#7-过程文件管理)。
+
+前端依赖实体位于 `D:\nvm\project-deps\agent-harness\node_modules\`，项目内同名目录是 Windows 目录联接。安装 Node.js、npm 或 nvm 并不会把每个项目的依赖自动装成全局库；项目仍需按自己的锁文件安装。`D:\nodejs` 在本机 nvm 配置中是 Node.js 切换位置，项目依赖使用独立的 `D:\nvm\project-deps\`，避免与版本切换混在一起。下载缓存和全局命令目录保持现有配置。
+
+以后安装或恢复前端依赖使用 `deps`；按更新后的锁文件重新安装使用 `.\interfaces\web\frontend\install-deps.ps1 -Refresh`。不要在源码目录直接执行 `npm install` 或 `npm ci`，它们可能替换联接并在仓库内重新创建依赖。`npm --prefix interfaces/web/frontend run build`、`run dev`、`run typecheck` 仍可正常使用。开发与构建已固定使用 webpack，以支持外部依赖联接。详细原理和验证命令见 [Node.js 与前端目录说明](docs/project-guide.zh-CN.md#8-nodejsnpm-与前端目录的区别)。
 
 迁移前端的源码与导出产物已作为包资源声明；构建 wheel 前先构建前端。Web 生命周期使用 [FastAPI lifespan](https://fastapi.tiangolo.com/advanced/events/)，开发代理使用 [Next rewrites](https://nextjs.org/docs/app/api-reference/config/next-config-js/rewrites)，生产构建沿用 [Next 静态导出](https://nextjs.org/docs/app/guides/static-exports)。
