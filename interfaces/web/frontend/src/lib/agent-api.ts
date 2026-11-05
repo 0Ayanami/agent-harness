@@ -14,6 +14,7 @@ export async function agentApi<T>(path: string, options: RequestInit = {}): Prom
       ? detail.detail : `HTTP ${response.status}: ${response.statusText}`;
     throw new Error(message);
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 

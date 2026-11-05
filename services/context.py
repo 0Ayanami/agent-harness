@@ -104,9 +104,10 @@ class ContextService:
             self.PROMPT_SECTIONS["tasks"],
             self.PROMPT_SECTIONS["teams"],
             self.PROMPT_SECTIONS["workspace"],
-            self.PROMPT_SECTIONS["memory"],
-            self.PROMPT_SECTIONS["compaction"],
         ]
+        if context.get("memory_catalog") or context.get("memories"):
+            sections.append(self.PROMPT_SECTIONS["memory"])
+        sections.append(self.PROMPT_SECTIONS["compaction"])
         sections.append(f"Current time: {datetime.now().isoformat(timespec='seconds')}")
         sections.append(
             "Skills catalog:\n"

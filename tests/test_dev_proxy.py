@@ -71,7 +71,7 @@ def test_next_development_proxy_streams_before_run_finishes(tmp_path):
             else:
                 raise AssertionError("Next development proxy did not become ready")
             page = browser.get(f"{origin}/zh/", timeout=60, follow_redirects=True)
-            assert page.status_code == 200 and "Learn Claude Code" in page.text
+            assert page.status_code == 200 and "<title>AYANAMI</title>" in page.text
             headers = {"X-Agent-Client": "web", "Origin": origin}
             created = browser.post(f"{origin}/api/agent/sessions", headers=headers)
             assert created.status_code == 201, created.text

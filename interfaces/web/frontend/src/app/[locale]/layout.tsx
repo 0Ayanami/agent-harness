@@ -1,12 +1,13 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { I18nProvider } from "@/lib/i18n";
+import { SITE_NAME } from "@/lib/site";
 import { Header } from "@/components/layout/header";
 import "../globals.css";
 
 export const metadata: Metadata = {
-  title: "Agent Workbench · Learn Claude Code",
-  description: "Run the modular Agent Harness with the original Learn Claude Code interface.",
+  title: SITE_NAME,
+  description: "Agent workbench and knowledge library.",
 };
 
 export function generateStaticParams() {

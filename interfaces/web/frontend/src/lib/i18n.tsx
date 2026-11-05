@@ -4,6 +4,8 @@ import en from "@/i18n/messages/en.json";
 import zh from "@/i18n/messages/zh.json";
 import ja from "@/i18n/messages/ja.json";
 import { runtimeMessages } from "@/i18n/runtime-messages";
+import { libraryMessages } from "@/i18n/library-messages";
+import { ragMessages } from "@/i18n/rag-messages";
 
 type Messages = typeof en;
 
@@ -26,8 +28,14 @@ export function I18nProvider({ locale, children }: { locale: string; children: R
 export function useTranslations(namespace?: string) {
   const { locale, messages } = useContext(I18nContext);
   return (key: string) => {
+    if (namespace === "rag") {
+      return ragMessages[locale]?.[key] || ragMessages.en[key] || key;
+    }
     if (namespace === "runtime") {
       return runtimeMessages[locale]?.[key] || runtimeMessages.en[key] || key;
+    }
+    if (namespace === "library") {
+      return libraryMessages[locale]?.[key] || libraryMessages.en[key] || key;
     }
     const dictionary = messages as Record<string, unknown>;
     const ns = namespace ? dictionary[namespace] : dictionary;

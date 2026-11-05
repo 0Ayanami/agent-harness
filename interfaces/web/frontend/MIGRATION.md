@@ -17,15 +17,15 @@ copied exactly; adapted components retain the existing rendering implementation.
 | `src/components/ui/card.tsx` | same relative path | Unchanged. |
 | `src/components/ui/badge.tsx` | same relative path | Unchanged layer badges and colors. |
 | `src/components/ui/tabs.tsx` | same relative path | Unchanged. Used for conversation/trace and project state. |
-| `src/components/layout/header.tsx` | same relative path | Retains brand, language switching, responsive navigation, and theme toggle. Adds the workbench item; course links open the original teaching site. Adds accessible button labels. |
-| `src/components/layout/sidebar.tsx` | same relative path | Retains chapter grouping and styles in an expandable course section. Adds real session creation and selection. |
+| `src/components/layout/header.tsx` | same relative path | Shows AYANAMI, workbench and library navigation, language and theme controls, and the project repository link. |
+| `src/components/layout/sidebar.tsx` | same relative path | Groups workbench and library links in a collapsible Workspace section alongside the session list. |
 | `src/components/simulator/simulator-message.tsx` | same relative path | Retains original icons, message type colors, borders, and motion. Localizes labels, preserves whitespace, and receives only actual runtime messages and tool events. |
 | `src/lib/utils.ts` | same relative path | Unchanged. |
 | `src/lib/constants.ts` | same relative path | Unchanged chapter navigation metadata; no generated course source/document data. |
 | `src/lib/i18n.tsx` | same relative path | Retains provider/hooks, adds typed access and a workbench namespace. |
 | `src/i18n/messages/{en,zh,ja}.json` | same relative paths | Unchanged teaching dictionaries. |
 | `src/types/agent-data.ts` | same relative path | Unchanged component types. |
-| `src/app/[locale]/layout.tsx` | same relative path | Retains locale provider, header, main shell, and local theme initialization. Metadata describes the runtime workbench. |
+| `src/app/[locale]/layout.tsx` | same relative path | Retains locale provider, header, main shell, and local theme initialization. Metadata uses the AYANAMI site name. |
 | `src/app/page.tsx` | `src/app/(entry)/page.tsx` | Retains the default Chinese redirect; the entry route has its own root layout for webpack builds. |
 | `src/app/favicon.ico` | same relative path | Unchanged original site favicon. |
 | `tsconfig.json` | same relative path | Preserves compiler options; stores incremental state in the repository's `.artifacts/cache/typescript/` directory. |
@@ -105,10 +105,6 @@ npm --prefix interfaces/web/frontend run dev -- --port 3000
 
 All browser requests use `/api/agent/*`. Development rewrites proxy them to
 `${AGENT_API_URL}/api/*`; the production Python app serves the same prefix.
-`NEXT_PUBLIC_TEACHING_URL` optionally points the retained course navigation to
-a separately running copy of `web/` (for example `http://127.0.0.1:3001`). Its
-default is the original project's public teaching site. The value is used when
-Next builds the static output.
 
 `python -m agent_harness --dev --port 8000 --web-port 3000` starts both
 development services with matching configuration from a single command.

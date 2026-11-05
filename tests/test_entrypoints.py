@@ -87,7 +87,7 @@ def test_default_entrypoint_serves_migrated_export(tmp_path):
                 raise AssertionError("Migrated web server did not become ready")
             assert health.json()["model"] == "entry-test-model"
             page = client.get(f"http://127.0.0.1:{port}/zh/")
-            assert page.status_code == 200 and "Learn Claude Code" in page.text
+            assert page.status_code == 200 and "<title>AYANAMI</title>" in page.text
             import re
 
             scripts = re.findall(r'<script[^>]+src="([^"]+)"', page.text)

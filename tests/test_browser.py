@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 import uvicorn
-
 from agent_harness import HarnessConfig
 from agent_harness.interfaces.web.app import create_app
 from agent_harness.interfaces.web.host import frontend_directory
@@ -45,6 +44,9 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
     assert (output / "zh" / "index.html").exists(), (
         "Build the migrated frontend before running browser tests"
     )
+    memory_dir = tmp_path / ".memory"
+    memory_dir.mkdir()
+    (memory_dir / "MEMORY.md").write_text("- Browser test memory\n", encoding="utf-8")
     app = create_app(
         HarnessConfig(tmp_path, "browser-test-model"), BrowserModel, frontend_directory=output
     )
@@ -61,14 +63,38 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
     try:
         with browser_api.sync_playwright() as playwright:
             browser = playwright.chromium.launch(executable_path=executable, headless=True)
-            page = browser.new_page(viewport={"width": 1440, "height": 950}, device_scale_factor=1)
+            page = browser.new_page(
+                viewport={"width": 1440, "height": 950},
+                device_scale_factor=1,
+                base_url=f"http://127.0.0.1:{port}",
+            )
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(f"http://127.0.0.1:{port}")
             browser_api.expect(page.locator("#connection")).to_have_text("本地服务已连接")
             browser_api.expect(page.locator("h1")).to_be_visible()
+            browser_api.expect(page).to_have_title("AYANAMI")
+            header = page.get_by_role("banner")
+            brand = header.get_by_role("link", name="AYANAMI", exact=True)
+            repository = header.get_by_role("link", name="GitHub", exact=True)
+            repository_url = "https://github.com/0Ayanami/agent-harness"
+            browser_api.expect(brand).to_be_visible()
+            browser_api.expect(repository).to_have_attribute("href", repository_url)
+            teaching_links = header.locator(
+                'a[href$="/timeline"], a[href$="/compare"], a[href$="/layers"]'
+            )
+            browser_api.expect(teaching_links).to_have_count(0)
+            workspace = page.get_by_test_id("workspace-menu")
+            summary = workspace.locator("summary")
+            browser_api.expect(summary).to_have_text("工作区")
+            browser_api.expect(workspace).not_to_have_attribute("open", "")
+            summary.click()
             browser_api.expect(
-                page.get_by_role("link", name="Learn Claude Code", exact=True)
-            ).to_be_visible()
+                workspace.get_by_role("link", name="Agent 工作台", exact=True)
+            ).to_have_attribute("aria-current", "page")
+            workspace.get_by_role("link", name="资料库", exact=True).click()
+            browser_api.expect(page).to_have_url(f"http://127.0.0.1:{port}/zh/library/")
+            brand.click()
+            browser_api.expect(page.locator("#connection")).to_have_text("本地服务已连接")
             page.screenshot(path=str(artifacts / "web-desktop.png"), full_page=True)
             page.locator("#message").fill("运行网页联调")
             page.locator("#send").click()
@@ -90,6 +116,12 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
             page.set_viewport_size({"width": 390, "height": 844})
             browser_api.expect(page.locator("#composer")).to_be_visible()
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+            mobile_menu = header.get_by_role("button", name="切换导航")
+            mobile_menu.click()
+            browser_api.expect(repository).to_have_attribute("href", repository_url)
+            browser_api.expect(teaching_links).to_have_count(0)
+            browser_api.expect(header.get_by_test_id("library-nav-mobile")).to_be_visible()
+            mobile_menu.click()
             page.screenshot(path=str(artifacts / "web-mobile.png"), full_page=True)
             page.set_viewport_size({"width": 1440, "height": 950})
 
@@ -125,9 +157,83 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
             browser_api.expect(page.locator("html")).to_have_class("dark")
             page.get_by_role("button", name="EN", exact=True).click()
             browser_api.expect(page.locator("h1")).to_have_text("Agent Workbench")
+            browser_api.expect(page).to_have_title("AYANAMI")
             browser_api.expect(page.locator(".message.assistant .body")).to_contain_text(
                 "browser-ready"
             )
+
+            personalized = page.get_by_test_id("session-personalized")
+            temporary = page.get_by_test_id("session-temporary")
+            memory_hint = page.locator("#conversation-memory-hint")
+            page.get_by_role("button", name="Memory", exact=True).click()
+            memories = page.locator("#memories")
+            browser_api.expect(memories).to_contain_text("Browser test memory")
+            browser_api.expect(personalized).to_be_checked()
+            browser_api.expect(temporary).not_to_be_checked()
+            temporary.click()
+            browser_api.expect(temporary).to_be_checked()
+            browser_api.expect(memory_hint).to_contain_text("Writes are paused")
+            browser_api.expect(memories).to_contain_text("Browser test memory")
+            personalized.click()
+            browser_api.expect(personalized).not_to_be_checked()
+            browser_api.expect(memory_hint).to_contain_text(
+                "skips long-term memory reads and writes"
+            )
+            browser_api.expect(memories).to_have_text("No project memory yet")
+            page.reload()
+            browser_api.expect(page.locator("#connection")).to_have_text("Local service connected")
+            browser_api.expect(personalized).not_to_be_checked()
+            browser_api.expect(temporary).to_be_checked()
+
+            active = page.locator("#sessions")
+            archived = page.get_by_test_id("archived-conversations")
+            first_row = active.locator(f'[data-session-row="{first_id}"]')
+            second_row = active.locator(f'[data-session-row="{second_id}"]')
+            first_row.get_by_test_id("archive-conversation").click()
+            browser_api.expect(first_row).to_have_count(0)
+            browser_api.expect(second_row.locator("[data-session-id]")).to_have_attribute(
+                "aria-current", "page"
+            )
+            browser_api.expect(personalized).to_be_checked()
+            browser_api.expect(temporary).not_to_be_checked()
+
+            page.reload()
+            browser_api.expect(page.locator("#connection")).to_have_text("Local service connected")
+            archived.locator("summary").click()
+            archived_first = archived.locator(f'[data-session-row="{first_id}"]')
+            archived_first.get_by_test_id("restore-conversation").click()
+            browser_api.expect(archived_first).to_have_count(0)
+            browser_api.expect(page.locator(".message.assistant .body")).to_contain_text(
+                "browser-ready"
+            )
+            browser_api.expect(personalized).not_to_be_checked()
+            browser_api.expect(temporary).to_be_checked()
+
+            first_row.get_by_test_id("delete-conversation").click()
+            confirmation = page.get_by_test_id("delete-conversation-dialog")
+            browser_api.expect(confirmation).to_be_visible()
+            confirmation.get_by_role("button", name="Cancel", exact=True).click()
+            browser_api.expect(first_row).to_be_visible()
+            first_row.get_by_test_id("delete-conversation").click()
+            confirmation.get_by_test_id("confirm-delete-conversation").click()
+            browser_api.expect(confirmation).to_have_count(0)
+            browser_api.expect(first_row).to_have_count(0)
+            assert page.request.get(f"/api/agent/sessions/{first_id}").status == 404
+
+            second_row.get_by_test_id("archive-conversation").click()
+            browser_api.expect(second_row).to_have_count(0)
+            browser_api.expect(active.locator("[data-session-id]")).to_have_count(1)
+            browser_api.expect(page.locator("#message")).to_be_enabled()
+            browser_api.expect(personalized).to_be_checked()
+            browser_api.expect(temporary).not_to_be_checked()
+
+            archived_second = archived.locator(f'[data-session-row="{second_id}"]')
+            archived_second.get_by_test_id("delete-conversation").click()
+            confirmation.get_by_test_id("confirm-delete-conversation").click()
+            browser_api.expect(archived.get_by_test_id("archived-conversation-count")).to_have_text(
+                "0"
+            )
+            assert page.request.get(f"/api/agent/sessions/{second_id}").status == 404
             assert errors == []
             browser.close()
     finally:

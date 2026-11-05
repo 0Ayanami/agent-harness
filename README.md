@@ -2,7 +2,7 @@
 
 这是从教学工程中独立出来的 agent 应用。本仓库根目录就是应用目录，Python 包名为 `agent_harness`；原教学工程的 `s01_*` 到 `s17_*`、`agents/` 和 `web/` 不在当前仓库中。
 
-本版把已有能力组织为组合式运行时，网页从原有 `web/` 的 Next.js 工程迁移：沿用原站的布局、配色、主题切换、多语言、UI 和模拟器消息组件，将消息来源接入实际 agent。主循环、子 agent、记忆、任务、团队、上下文压缩、后台任务、cron 和模拟 MCP 能力沿用现有项目的算法。没有实现文档入库、向量检索或 RAG 知识库。
+本版把已有能力组织为组合式运行时，网页从原有 `web/` 的 Next.js 工程迁移，沿用原站的布局、主题、多语言和消息组件，并接入实际 Agent。主循环、子 Agent、记忆、任务、团队、上下文压缩、后台任务、cron 和模拟 MCP 沿用现有项目的算法。资料库提供文件管理、自动入库、关键词与混合检索，以及可定位到原文的 Agent 问答。
 
 ## 启动网页
 
@@ -13,8 +13,7 @@ Set-Location D:\research\agent-harness
 . .\.venv\Scripts\Activate.ps1
 uv sync --frozen
 .\scripts\project.ps1 deps
-$env:NEXT_TELEMETRY_DISABLED = '1'
-npm --prefix interfaces/web/frontend run build
+.\scripts\project.ps1 build
 .\scripts\project.ps1 run
 ```
 
@@ -37,7 +36,30 @@ python -m agent_harness
 
 网页支持新建和切换会话、连续对话、查看工具调用与输出、命令权限确认、停止执行，以及查看任务看板和项目记忆。刷新网页会恢复对话、运行状态和等待确认的操作。权限确认在网页内完成，不依赖后端终端输入。
 
-`interfaces/web/frontend/` 来自原教学工程的网页，侧栏保留原章节分组与教学链接，新增会话入口；原模拟器的 `SimulatorMessage` 用于呈现真实对话和工具事件。课程场景与课程生成数据没有复制到运行包。迁移来源与适配范围见 `interfaces/web/frontend/MIGRATION.md`。
+在侧栏可以归档和恢复会话，也可以确认后删除会话。归档保留对话记录和引用。需要结束正在执行的任务时，先在工作台停止，再管理会话。
+
+「使用资料库」旁的记忆选项按会话保存，可在空闲时调整。个性化默认开启，临时会话默认关闭。
+
+| 个性化 | 临时会话 | 读取长期记忆 | 从新消息提取长期记忆 |
+| --- | --- | --- | --- |
+| 开 | 关 | 是 | 是 |
+| 开 | 开 | 是 | 否 |
+| 关 | 关 | 否 | 否 |
+| 关 | 开 | 否 | 否 |
+
+临时会话仍保存本地对话历史，后续可以从侧栏打开。重新允许写入后，自动提取只考虑当时新发送的用户消息。资料库问答继续以当前选择的资料为证据。
+
+## 使用资料库
+
+1. 打开 [资料库](http://127.0.0.1:8000/zh/library/)，上传 Markdown、TXT 或 PDF（单文件最多 25 MiB）。支持名称搜索、筛选、排序、分页、收藏、预览、下载、改名、替换和删除。
+2. 等待文本索引就绪，选择正文关键词搜索。配置 Embedding 后还可等待语义索引就绪，再选混合检索。命中结果可以打开原文的 PDF 页码或文本行号。扫描 PDF 会提示需要 OCR。
+3. 在工作台开启 **使用资料库**，选择 **全部资料**、**仅收藏** 或 **指定文件**，再提交问题。也可以从文件详情点击 **基于此文件提问**。回答下方的来源可打开原文，刷新后会恢复引用。
+
+百炼 Embedding 复用后端 `.env` 的 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`，默认 `EMBEDDING_MODEL=text-embedding-v4`、`EMBEDDING_DIMENSIONS=1024`。需要独立配置时可用 `EMBEDDING_API_KEY` 和 `EMBEDDING_BASE_URL` 覆盖。聊天继续读取 `MODEL_ID` 和 Anthropic 兼容接口配置。启用 Embedding 后，索引构建会向向量服务发送正文分块，混合检索会发送查询。生成资料库回答时，聊天服务会收到本轮问题和命中的证据。
+
+原件、SQLite 和本地 Qdrant 索引保存在当前工作目录的 `.runtime/agent-harness/library/`。同一工作目录重启可继续使用。语义索引未配置或暂不可用时，混合检索会提示实际使用的关键词模式。资料库问答按轮次隔离证据，追问时请在本轮写明所指内容。验证记录和学习说明见 [资料库阶段总结](docs/library-stage-summary.zh-CN.md)。
+
+AYANAMI 网页沿用原教学工程的界面基础。顶栏和左侧可折叠的「工作区」都可以进入 Agent 工作台和资料库。侧栏单独提供会话创建与切换。原模拟器的 `SimulatorMessage` 用于呈现真实对话和工具事件。迁移来源见 `interfaces/web/frontend/MIGRATION.md`。
 
 完整启动排错、当前架构、知识库开发方向与学习顺序见 [项目导读与运行手册](docs/project-guide.zh-CN.md)。`docs/zh/` 和现有面试问答保留了原教学仓库背景，其中的旧启动命令和源码路径不能直接用于当前仓库。
 
@@ -75,6 +97,10 @@ agent-harness/                 # 仓库目录；安装后的 Python 包名是 ag
 │   ├── team.py                 # 持久 teammate 与团队协议
 │   ├── background.py           # 后台工具工作与结果通知
 │   ├── scheduler.py            # 持久 cron 与交付确认
+│   ├── library.py              # 文件资料库用例与版本原件生命周期
+│   ├── ingestion.py            # 持久入库任务、后台 worker 与关键词检索用例
+│   ├── retrieval.py            # 向量入库、混合召回与当前版本核验
+│   ├── library_rag.py           # 每轮证据、检索工具与来源引用
 │   └── permissions.py          # 工具权限政策；通过回调询问用户
 ├── tools/
 │   ├── schemas.py              # 模型可见的工具契约
@@ -85,6 +111,11 @@ agent-harness/                 # 仓库目录；安装后的 Python 包名是 ag
 ├── infrastructure/
 │   ├── model.py                # SDK 调用、重试、fallback
 │   ├── sessions.py             # SQLite 会话与事件仓库
+│   ├── library.py              # 资料库 SQLite 元数据、原件与持久清理队列
+│   ├── library_index.py        # 入库任务、分块与当前版本 FTS5 索引
+│   ├── embeddings.py           # 百炼兼容 HTTP 适配器
+│   ├── library_vectors.py      # Qdrant 本地向量索引
+│   ├── document_parser.py      # MD/TXT/PDF 解析、来源位置与中文词元规范化
 │   ├── tasks.py                # JSON 任务仓库与文件事务锁
 │   ├── git.py                  # Git / worktree 命令适配
 │   ├── mailbox.py              # 文件消息总线
@@ -94,6 +125,7 @@ agent-harness/                 # 仓库目录；安装后的 Python 包名是 ag
 │   ├── cli.py                 # 终端输入与展示
 │   └── web/
 │       ├── app.py             # HTTP 与 SSE；不实现 agent 业务逻辑
+│       ├── library.py         # 资料库文件管理 HTTP 接口
 │       ├── host.py            # 托管静态产物，或管理开发服务器
 │       └── frontend/          # 从原 web 迁移的 Next.js 工程
 │           ├── src/components/ # 布局、UI、消息组件及运行适配

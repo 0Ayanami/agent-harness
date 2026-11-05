@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { API_PREFIX, agentApi, replayEvents } from "@/lib/agent-api";
-import type { Approval, Health, RuntimeEvent, RuntimeMessage, SessionInfo, SessionSnapshot } from "@/types/runtime";
+import type { Approval, Health, LibraryQuestion, LibraryRetrieval, LibrarySource, RuntimeEvent, RuntimeMessage, SessionChanges, SessionInfo, SessionSnapshot } from "@/types/runtime";
 
 type Connection = "connecting" | "connected" | "reconnecting" | "failed";
 interface SessionView {
@@ -12,6 +12,14 @@ interface SessionView {
   busy: boolean;
   cancelling: boolean;
   cursor: number;
+  retrieval?: LibraryRetrieval;
+}
+
+function sourceList(input: unknown): LibrarySource[] {
+  if (!Array.isArray(input)) return [];
+  return input.filter((source): source is LibrarySource => source && typeof source === "object" &&
+    /^S\d+$/.test(source.id) && ["document_id", "version_id", "chunk_id", "name", "text"].every((key) => typeof source[key] === "string") &&
+    source.location && typeof source.location === "object");
 }
 
 function value(payload: Record<string, unknown>, key: string) {
@@ -24,7 +32,7 @@ function eventMessage(event: RuntimeEvent): RuntimeMessage | null {
   const content = value(payload, "text");
   if (kind === "user" || kind === "assistant") {
     if (!content) return null;
-    return { id: `event-${id}`, trace: payload.scope === "subagent", step: {
+    return { id: `event-${id}`, runId: value(payload, "run_id") || undefined, trace: payload.scope === "subagent", step: {
       type: kind === "user" ? "user_message" : "assistant_text",
       content, annotation: payload.scope === "subagent" ? "subagent" : "",
     } };
@@ -69,6 +77,24 @@ function applyEvent(view: SessionView, event: RuntimeEvent, replay = false): Ses
   const entry = eventMessage(event);
   // Persisted events provide one ordered transcript, including errors and cancellations.
   if (entry) next.messages = [...next.messages, entry];
+  if (event.kind === "library_retrieval") {
+    next.retrieval = { run_id: value(event.payload, "run_id"), mode: value(event.payload, "mode"),
+      warning: value(event.payload, "warning") || null, sources: sourceList(event.payload.sources) };
+  }
+  if (event.kind === "library_answer") {
+    const runId = value(event.payload, "run_id");
+    if (!runId) return next;
+    const text = value(event.payload, "text");
+    const invalid = event.payload.invalid_citations;
+    const citations = sourceList(event.payload.citations);
+    const update = { runId, citations, citationWarning: value(event.payload, "warning") || undefined,
+      invalidCitations: Array.isArray(invalid) ? invalid.filter((item): item is string => typeof item === "string") : [] };
+    const index = next.messages.findLastIndex((message) => message.runId === runId && message.step.type === "assistant_text" && !message.trace);
+    if (index >= 0) next.messages = next.messages.map((message, position) => position === index
+      ? { ...message, ...update, step: { ...message.step, content: typeof event.payload.text === "string" ? text : message.step.content } } : message);
+    else if (text) next.messages = [...next.messages, { id: `event-${event.id}`, trace: false, ...update, step: { type: "assistant_text", content: text, annotation: "" } }];
+  }
+  if (event.kind === "run_started") next.retrieval = undefined;
   if (replay) return next;
   if (event.kind === "run_started") { next.busy = true; next.cancelling = false; }
   if (event.kind === "run_finished") { next.busy = false; next.cancelling = false; }
@@ -89,6 +115,8 @@ function savedSession() { try { return localStorage.getItem("harness.session"); 
 export function useAgentSession() {
   const [health, setHealth] = useState<Health | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [archivedSessions, setArchivedSessions] = useState<SessionInfo[]>([]);
+  const [sessionActionPending, setSessionActionPending] = useState(false);
   const [view, setView] = useState<SessionView | null>(null);
   const [loading, setLoading] = useState(true);
   const [connection, setConnection] = useState<Connection>("connecting");
@@ -100,6 +128,8 @@ export function useAgentSession() {
   const seen = useRef(new Set<number>());
   const mounted = useRef(false);
   const posting = useRef(false);
+  const changingSession = useRef(false);
+  const settingsRevision = useRef(0);
   const sessionListRequest = useRef(0);
 
   const reportError = useCallback((issue: unknown) => {
@@ -108,18 +138,28 @@ export function useAgentSession() {
 
   const refreshSessions = useCallback(async () => {
     const request = ++sessionListRequest.current;
-    const list = await agentApi<SessionInfo[]>("/sessions");
-    if (mounted.current && request === sessionListRequest.current) setSessions(list);
+    const [list, archived] = await Promise.all([
+      agentApi<SessionInfo[]>("/sessions"), agentApi<SessionInfo[]>("/sessions?archived=true"),
+    ]);
+    if (mounted.current && request === sessionListRequest.current) {
+      setSessions(list);
+      setArchivedSessions(archived);
+    }
     return list;
   }, []);
 
   const refreshSnapshot = useCallback(async (sessionId: string, version: number) => {
+    const revision = settingsRevision.current;
     const snapshot = await agentApi<SessionSnapshot>(`/sessions/${sessionId}`);
     if (!mounted.current || selectedId.current !== sessionId || generation.current !== version) return;
     setView((current) => {
       if (!current || current.snapshot.id !== sessionId) return current;
       const latest = snapshot.cursor >= current.cursor;
-      return { ...current, snapshot,
+      const preferences = revision === settingsRevision.current ? {} : {
+        personalized: current.snapshot.personalized, temporary: current.snapshot.temporary,
+        state: { ...snapshot.state, memory_catalog: current.snapshot.state.memory_catalog },
+      };
+      return { ...current, snapshot: { ...snapshot, ...preferences },
         ...(latest ? { busy: snapshot.status === "running", approvals: snapshot.approvals, cursor: snapshot.cursor } : {}),
       };
     });
@@ -216,14 +256,81 @@ export function useAgentSession() {
     };
   }, [initialize]);
 
-  const sendMessage = async (message: string) => {
+  const changeSession = async (sessionId: string, patch?: SessionChanges) => {
+    if (posting.current || changingSession.current) return false;
+    changingSession.current = true;
+    setSessionActionPending(true);
+    setError(null);
+    let committed = false;
+    try {
+      const path = `/sessions/${sessionId}`;
+      let updated: SessionSnapshot | null = null;
+      if (patch) updated = await agentApi<SessionSnapshot>(path, { method: "PATCH", body: JSON.stringify(patch) });
+      else await agentApi<void>(path, { method: "DELETE" });
+      committed = true;
+      if (!mounted.current) return true;
+
+      if (updated && patch?.archived === undefined) {
+        settingsRevision.current++;
+        const { personalized, temporary, state } = updated;
+        setView((current) => current?.snapshot.id === sessionId
+          ? { ...current, snapshot: { ...current.snapshot, personalized, temporary,
+            state: { ...current.snapshot.state, memory_catalog: state.memory_catalog },
+          } } : current);
+        return true;
+      }
+
+      // Invalidate list responses started before the mutation reached the server.
+      sessionListRequest.current++;
+      if (updated && patch?.archived === false) {
+        setSessions((list) => [updated, ...list.filter((session) => session.id !== sessionId)]);
+        setArchivedSessions((list) => list.filter((session) => session.id !== sessionId));
+        await openSession(sessionId);
+        return true;
+      }
+
+      setSessions((list) => list.filter((session) => session.id !== sessionId));
+      setArchivedSessions((list) => {
+        const remaining = list.filter((session) => session.id !== sessionId);
+        return updated ? [updated, ...remaining] : remaining;
+      });
+      const removedSelection = selectedId.current === sessionId;
+      if (removedSelection) {
+        generation.current++;
+        source.current?.close();
+        loadController.current?.abort();
+        selectedId.current = null;
+        setView(null);
+        setLoading(true);
+        setConnection("connecting");
+        try { if (savedSession() === sessionId) localStorage.removeItem("harness.session"); } catch {}
+      }
+      const active = await refreshSessions();
+      if (mounted.current && removedSelection && !selectedId.current) {
+        if (active.length) await openSession(active[0].id);
+        else await createSession();
+      }
+    } catch (issue) {
+      reportError(issue);
+      if (mounted.current && !selectedId.current) {
+        setConnection("failed");
+        setLoading(false);
+      }
+    } finally {
+      changingSession.current = false;
+      if (mounted.current) setSessionActionPending(false);
+    }
+    return committed;
+  };
+
+  const sendMessage = async (message: string, library?: LibraryQuestion) => {
     const sessionId = selectedId.current;
-    if (!sessionId || posting.current) return false;
+    if (!sessionId || posting.current || changingSession.current) return false;
     posting.current = true;
     const version = generation.current;
     setView((current) => current ? { ...current, busy: true } : current);
     try {
-      await agentApi(`/sessions/${sessionId}/messages`, { method: "POST", body: JSON.stringify({ message }) });
+      await agentApi(`/sessions/${sessionId}/messages`, { method: "POST", body: JSON.stringify({ message, ...(library?.enabled ? { library } : {}) }) });
       // A delayed POST response must not clear the draft in a different session.
       return mounted.current && version === generation.current;
     } catch (issue) {
@@ -257,8 +364,8 @@ export function useAgentSession() {
   };
 
   return {
-    health, sessions, view, loading, connection, error, selectedId: selectedId.current,
-    openSession, createSession, sendMessage, cancel, answerApproval, reportError,
+    health, sessions, archivedSessions, sessionActionPending, view, loading, connection, error, selectedId: selectedId.current,
+    openSession, createSession, changeSession, sendMessage, cancel, answerApproval, reportError,
     dismissError: () => setError(null), reconnect: initialize,
     refresh: () => selectedId.current && refreshSnapshot(selectedId.current, generation.current).catch(reportError),
   };

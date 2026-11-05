@@ -121,6 +121,73 @@ def test_memory_recall_falls_back_when_model_unavailable(runtime):
         runtime.memory.memory_path("../escape.md")
 
 
+@pytest.mark.parametrize(
+    ("personalized", "temporary", "reads", "writes"),
+    [
+        (True, False, True, True),
+        (True, True, True, False),
+        (False, False, False, False),
+        (False, True, False, False),
+    ],
+)
+def test_session_memory_policy_controls_automatic_and_file_tool_access(
+    runtime, personalized, temporary, reads, writes
+):
+    runtime.memory.write_memory_file("Language", "user", "Language preference", "Use Chinese")
+    runtime.set_memory_options(personalized=personalized, temporary=temporary)
+    calls = []
+    request = "I prefer compact examples in future chats"
+    earlier = "An earlier turn that must never be automatically backfilled"
+
+    def complete(**arguments):
+        calls.append(arguments)
+        if arguments["max_tokens"] == 200:
+            return response(text("[0]"))
+        if arguments["max_tokens"] == 1000:
+            return response(
+                text(
+                    json.dumps(
+                        [
+                            {
+                                "name": "Examples",
+                                "type": "user",
+                                "scope": "persistent",
+                                "description": "Example format",
+                                "body": "Use compact examples",
+                            }
+                        ]
+                    )
+                )
+            )
+        return response(text("Done"))
+
+    runtime.gateway.client.messages.create = complete
+    history = [
+        {"role": "user", "content": earlier},
+        {"role": "assistant", "content": "Earlier reply"},
+        {"role": "user", "content": request},
+    ]
+    runtime.run(history, request, memory_source=[{"role": "user", "content": request}])
+
+    main = next(call for call in calls if call["max_tokens"] == runtime.config.max_tokens)
+    assert ("Use Chinese" in main["system"]) is reads
+    assert bool(runtime.summary()["memory_catalog"]) is reads
+    assert any(call["max_tokens"] == 200 for call in calls) is reads
+    extractions = [call for call in calls if call["max_tokens"] == 1000]
+    assert bool(extractions) is writes
+    if writes:
+        prompt = extractions[0]["messages"][0]["content"]
+        assert request in prompt
+        assert earlier not in prompt
+    assert (runtime.memory.MEMORY_DIR / "examples.md").exists() is writes
+    assert ("Use Chinese" in runtime.workspace.run_read(".memory/language.md")) is reads
+    assert ("language.md" in runtime.workspace.run_glob(".memory/*.md")) is reads
+    assert runtime.workspace.run_write(".memory/explicit.md", "text").startswith("Wrote") is writes
+    edited = runtime.workspace.run_edit(".memory/language.md", "Use Chinese", "Use English")
+    assert edited.startswith("Edited") is writes
+    assert runtime.workspace.run_write("regular.txt", "still available").startswith("Wrote")
+
+
 def test_task_dependencies_and_durable_state(runtime):
     before, after = (
         runtime.tasks.create_task("before"),

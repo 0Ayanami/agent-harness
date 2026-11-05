@@ -39,6 +39,27 @@ def test_api_metadata_and_health(web):
     assert browser.get("/api/health").json()["model"] == "test-model"
 
 
+@pytest.mark.parametrize(
+    "library",
+    [
+        {"enabled": True, "document_id": "selected"},
+        {"enabled": True, "favorites_only": "true"},
+        {"enabled": True, "document_ids": [""]},
+        {"enabled": True, "mode": "vector"},
+    ],
+)
+def test_invalid_library_options_cannot_launch_a_turn(web, library):
+    browser, application, model, session_id = web
+    response = browser.post(
+        f"/api/agent/sessions/{session_id}/messages",
+        headers=HEADERS,
+        json={"message": "search only the requested scope", "library": library},
+    )
+    assert response.status_code == 422
+    assert application.repository.events(session_id) == []
+    assert model.calls == []
+
+
 def test_multi_turn_chat_and_sse_cursor(web):
     browser, application, client, session_id = web
     client.replies = [response(text("first answer")), response(text("second answer"))]

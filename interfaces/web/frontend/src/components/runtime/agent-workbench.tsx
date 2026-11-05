@@ -11,33 +11,49 @@ import { ApprovalCard } from "./approval-card";
 import { ProjectState } from "./project-state";
 import { useTranslations } from "@/lib/i18n";
 import { useAgentSession } from "@/hooks/use-agent-session";
+import type { LibraryQuestion } from "@/types/runtime";
+import { LibraryQuestionControls } from "./library-question";
+import { LibraryRetrievalStatus, LibrarySources } from "./library-sources";
 
 export function AgentWorkbench() {
   const t = useTranslations("runtime");
   const agent = useAgentSession();
   const [draft, setDraft] = useState("");
+  const [library, setLibrary] = useState<LibraryQuestion>({ enabled: false, document_ids: null, favorites_only: false, mode: "hybrid" });
+  const [libraryValid, setLibraryValid] = useState(true);
   const bottom = useRef<HTMLDivElement>(null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const { view, loading, connection, health } = agent;
   const messages = view?.messages ?? [];
   const toolCount = messages.filter((message) => message.step.type === "tool_call").length;
   const status = view?.cancelling ? "cancelling" : view?.approvals.length ? "approval" : view?.busy ? "running" : "ready";
+  const optionsDisabled = loading || !view || view.busy || agent.sessionActionPending;
+  const personalized = view?.snapshot.personalized ?? true;
+  const temporary = view?.snapshot.temporary ?? false;
+  const memoryHint = !personalized ? "memoryDisabledHint" : temporary ? "memoryReadOnlyHint" : "memoryEnabledHint";
 
   useEffect(() => { setDraft(""); }, [agent.selectedId]);
+  useEffect(() => {
+    const selected = new URLSearchParams(window.location.search).get("library_file");
+    if (selected) setLibrary({ enabled: true, document_ids: [selected], favorites_only: false, mode: "hybrid" });
+  }, []);
   useEffect(() => { bottom.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }, [messages.length, view?.approvals.length]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (view?.busy) { await agent.cancel(); return; }
     const message = draft.trim();
-    if (message && await agent.sendMessage(message)) setDraft("");
+    if (message && libraryValid && await agent.sendMessage(message, library)) setDraft("");
   }
 
   return (
     <div className="flex min-w-0 flex-col gap-8 md:flex-row">
-      <Sidebar sessions={agent.sessions} selectedId={agent.selectedId} loading={loading}
+      <Sidebar sessions={agent.sessions} archivedSessions={agent.archivedSessions} selectedId={agent.selectedId}
+        loading={loading || agent.sessionActionPending} busy={!!view?.busy}
         onSelect={(id) => { agent.openSession(id).catch(agent.reportError); }}
-        onCreate={() => { agent.createSession().catch(agent.reportError); }} />
+        onCreate={() => { agent.createSession().catch(agent.reportError); }}
+        onArchiveChange={(id, archived) => agent.changeSession(id, { archived })}
+        onDelete={agent.changeSession} />
       <div className="min-w-0 flex-1">
         <div className="mb-6">
           <div className="mb-2 flex flex-wrap items-center gap-3">
@@ -59,6 +75,7 @@ export function AgentWorkbench() {
         </div>}
 
         <Card className="min-w-0 p-4 sm:p-6">
+          <LibraryRetrievalStatus retrieval={view?.retrieval} pending={!!view?.busy && library.enabled} />
           <div className="mb-4 flex items-center justify-between gap-4">
             <h2 id="session-title" className="truncate text-sm font-semibold">{view?.snapshot.title || t("newSession")}</h2>
             <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">{t("toolCall")}: <span id="tool-count">{toolCount}</span></span>
@@ -77,7 +94,7 @@ export function AgentWorkbench() {
                 )}
                 <div id={tab === "chat" ? "messages" : "timeline"} className="space-y-3">
                   {messages.filter((message) => message.trace === (tab === "trace")).map((message, index) => (
-                    <SimulatorMessage key={message.id} step={message.step} index={index} />
+                    <div key={message.id}><SimulatorMessage step={message.step} index={index} /><LibrarySources message={message} /></div>
                   ))}
                 </div>
                 {view?.busy && <p id="thinking" role="status" className="animate-pulse px-1 text-xs text-[var(--color-text-secondary)]">{t(status)}…</p>}
@@ -89,6 +106,21 @@ export function AgentWorkbench() {
             {view?.approvals.map((approval) => <ApprovalCard key={`${view.snapshot.id}-${approval.id}`} approval={approval} onAnswer={agent.answerApproval} onError={agent.reportError} />)}
           </div>
           <form id="composer" onSubmit={submit} className="mt-5 border-t border-[var(--color-border)] pt-4">
+            <LibraryQuestionControls value={library} onChange={setLibrary} disabled={optionsDisabled} onValidityChange={setLibraryValid}>
+              <label className="inline-flex min-h-8 cursor-pointer items-center gap-2 font-medium">
+                <input data-testid="session-personalized" type="checkbox" checked={personalized} disabled={optionsDisabled}
+                  aria-describedby="conversation-memory-hint" className="h-4 w-4 accent-zinc-800 dark:accent-zinc-200"
+                  onChange={(event) => { if (view) void agent.changeSession(view.snapshot.id, { personalized: event.target.checked }); }} />
+                {t("personalized")}
+              </label>
+              <label className="inline-flex min-h-8 cursor-pointer items-center gap-2 font-medium">
+                <input data-testid="session-temporary" type="checkbox" checked={temporary} disabled={optionsDisabled}
+                  aria-describedby="conversation-memory-hint" className="h-4 w-4 accent-zinc-800 dark:accent-zinc-200"
+                  onChange={(event) => { if (view) void agent.changeSession(view.snapshot.id, { temporary: event.target.checked }); }} />
+                {t("temporaryConversation")}
+              </label>
+              <p id="conversation-memory-hint" className="basis-full text-xs leading-5 text-[var(--color-text-secondary)]">{t(memoryHint)}</p>
+            </LibraryQuestionControls>
             <div className="flex items-end gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-2 focus-within:ring-2 focus-within:ring-blue-500/30">
               <textarea id="message" data-testid="message-input" ref={composer} value={draft}
                 onChange={(event) => setDraft(event.target.value)} disabled={loading || !view || view.busy}
@@ -100,7 +132,7 @@ export function AgentWorkbench() {
                 }}
                 className="max-h-40 min-w-0 flex-1 resize-y bg-transparent px-2 py-1 text-sm outline-none disabled:opacity-50" />
               <button id="send" data-testid={view?.busy ? "cancel-run" : "send-message"} type="submit"
-                disabled={loading || !view || view.cancelling || (!view.busy && !draft.trim())}
+                disabled={loading || !view || view.cancelling || (!view.busy && (agent.sessionActionPending || !draft.trim() || !libraryValid))}
                 aria-label={view?.busy ? t("stop") : t("send")}
                 className="flex min-h-10 shrink-0 items-center gap-1.5 rounded-md bg-zinc-900 px-3 text-sm font-medium text-white disabled:opacity-40 dark:bg-white dark:text-zinc-900">
                 {view?.busy ? <Square size={14} /> : <ArrowUp size={15} />}<span>{view?.busy ? t("stop") : t("send")}</span>
