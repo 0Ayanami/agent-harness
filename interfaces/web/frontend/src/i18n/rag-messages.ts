@@ -1,3 +1,10 @@
+export function retrievalMethodKey(mode: string) {
+  if (mode === "keyword") return "keywordUsed";
+  if (mode === "vector") return "vector";
+  if (mode === "hybrid") return "hybridUsed";
+  return "retrieval";
+}
+
 export const ragMessages: Record<string, Record<string, string>> = {
   zh: {
     enabled: "使用资料库", enabledHint: "先检索所选资料，再根据原文回答。", scope: "资料范围", all: "全部资料", favorites: "仅收藏", selected: "指定文件",
@@ -8,7 +15,9 @@ export const ragMessages: Record<string, Record<string, string>> = {
     semanticIndex: "语义索引", vectorQueued: "等待向量化", vectorProcessing: "正在向量化", vectorReady: "语义索引就绪", vectorFailed: "向量化失败", vectorMissing: "语义检索未配置", vectorUnknown: "尚未建立语义索引",
     vectorize: "重建语义索引", vectorizeRetry: "重试向量化", vectorizeHint: "语义索引就绪后，混合检索可使用这份资料的向量。", textFirst: "请先等待文本索引就绪。",
     savedHint: "文件自动建立文本索引。配置向量服务后还会建立语义索引；可在工作台开启资料库问答。", sourceUnavailable: "来源可能已更新或删除，打开后将核对当前原文。",
-    searchHybrid: "输入问题或相关描述…", resultsHint: "检索按所选范围查找；提示信息说明实际使用的方式。", scopeLimit: "每轮最多选择 100 份资料。", close: "关闭",
+    vector: "向量检索", vectorHint: "根据语义相似度匹配已建立语义索引的资料。", vectorConfigMissing: "语义检索未配置，向量检索将返回空结果。",
+    reranked: "已重排", notReranked: "未使用重排",
+    searchSemantic: "输入问题或相关描述…", resultsHint: "检索按所选范围查找；提示信息说明实际使用的方式。", scopeLimit: "每轮最多选择 100 份资料。", close: "关闭",
   },
   en: {
     enabled: "Use library", enabledHint: "Search the selected files before answering from their contents.", scope: "Source scope", all: "All files", favorites: "Favorites only", selected: "Selected files",
@@ -19,7 +28,9 @@ export const ragMessages: Record<string, Record<string, string>> = {
     semanticIndex: "Semantic index", vectorQueued: "Vectorization queued", vectorProcessing: "Vectorizing", vectorReady: "Semantic index ready", vectorFailed: "Vectorization failed", vectorMissing: "Semantic search not configured", vectorUnknown: "Not vectorized yet",
     vectorize: "Rebuild semantic index", vectorizeRetry: "Retry vectorization", vectorizeHint: "Hybrid search can use this file once its semantic index is ready.", textFirst: "Wait until the text index is ready.",
     savedHint: "Files receive a text index automatically, plus a semantic index when configured. Enable library answers in the workbench.", sourceUnavailable: "The source may have changed or been deleted. Opening it checks the current original.",
-    searchHybrid: "Ask a question or describe what you need…", resultsHint: "Search respects the selected scope and reports the retrieval method actually used.", scopeLimit: "Select up to 100 files per question.", close: "Close",
+    vector: "Vector search", vectorHint: "Match semantically similar passages from files with a ready semantic index.", vectorConfigMissing: "Semantic search is unconfigured. Vector search will return no results.",
+    reranked: "Reranked", notReranked: "Reranking skipped",
+    searchSemantic: "Ask a question or describe what you need…", resultsHint: "Search respects the selected scope and reports the retrieval method actually used.", scopeLimit: "Select up to 100 files per question.", close: "Close",
   },
   ja: {
     enabled: "資料を使用", enabledHint: "選択した資料を検索し、原文に基づいて回答します。", scope: "資料の範囲", all: "すべての資料", favorites: "お気に入りのみ", selected: "指定ファイル",
@@ -30,6 +41,8 @@ export const ragMessages: Record<string, Record<string, string>> = {
     semanticIndex: "意味インデックス", vectorQueued: "ベクトル化待ち", vectorProcessing: "ベクトル化中", vectorReady: "意味インデックス準備完了", vectorFailed: "ベクトル化に失敗", vectorMissing: "意味検索が未設定", vectorUnknown: "意味インデックス未作成",
     vectorize: "意味インデックスを再作成", vectorizeRetry: "ベクトル化を再試行", vectorizeHint: "意味インデックスが準備できると、複合検索で使用できます。", textFirst: "本文インデックスの完了をお待ちください。",
     savedHint: "本文を自動処理し、設定済みなら意味インデックスも作成します。ワークベンチで資料を使った回答を有効にできます。", sourceUnavailable: "資料が更新・削除された可能性があります。開くと現在の原文を確認します。",
-    searchHybrid: "質問や探したい内容を入力…", resultsHint: "選択範囲を検索し、実際に使用した検索方法を表示します。", scopeLimit: "1回の質問で最大100件まで選択できます。", close: "閉じる",
+    vector: "ベクトル検索", vectorHint: "意味インデックスが準備済みの資料から、意味の近い箇所を探します。", vectorConfigMissing: "意味検索が未設定のため、ベクトル検索では結果が返りません。",
+    reranked: "再順位付け済み", notReranked: "再順位付けなし",
+    searchSemantic: "質問や探したい内容を入力…", resultsHint: "選択範囲を検索し、実際に使用した検索方法を表示します。", scopeLimit: "1回の質問で最大100件まで選択できます。", close: "閉じる",
   },
 };

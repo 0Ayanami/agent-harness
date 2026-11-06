@@ -1,4 +1,4 @@
-"""Durable semantic indexing and source-checked reciprocal-rank-fusion retrieval."""
+"""Durable semantic indexing, scoped retrieval and optional model reranking."""
 
 import hashlib
 import json
@@ -10,6 +10,7 @@ from uuid import uuid4
 from ..infrastructure.embeddings import BailianEmbeddings, EmbeddingError
 from ..infrastructure.library import timestamp
 from ..infrastructure.library_vectors import QdrantLibraryIndex, VectorIndexError
+from ..infrastructure.reranking import BailianReranker, RerankError
 from .library import LibraryError
 
 logger = logging.getLogger(__name__)
@@ -18,13 +19,27 @@ logger = logging.getLogger(__name__)
 class RetrievalService:
     """One application-owned vector client/worker; all returned text comes from SQLite."""
 
-    def __init__(self, config, library, ingestion, *, embedding_client=None, vector_index=None):
+    def __init__(
+        self,
+        config,
+        library,
+        ingestion,
+        *,
+        embedding_client=None,
+        vector_index=None,
+        rerank_client=None,
+    ):
         self.config = config
         self.library = library
         self.ingestion = ingestion
         self.repository = library.repository
         self.configured = bool(config.embedding_api_key and config.embedding_base_url)
         self.provider = None
+        self.reranker = (
+            BailianReranker(config, client=rerank_client)
+            if config.rerank_api_key and config.rerank_base_url
+            else None
+        )
         self.profile = None
         self.vectors = vector_index
         self._own_vectors = vector_index is None
@@ -103,6 +118,8 @@ class RetrievalService:
                 self.vectors.close()
             if self.provider is not None and self._own_provider:
                 self.provider.close()
+            if self.reranker is not None:
+                self.reranker.close()
             self._closed = True
 
     def _ensure_vectors(self):
@@ -250,6 +267,8 @@ class RetrievalService:
             if self._error
             else "ready",
             "error": self._error,
+            "rerank_configured": self.reranker is not None,
+            "rerank_model": self.config.rerank_model if self.reranker is not None else None,
         }
 
     def _recover(self):
@@ -520,7 +539,8 @@ class RetrievalService:
             except LibraryError:
                 continue
             if current["version_id"] == hit["version_id"]:
-                result.append({**current, "score": hit["score"]})
+                ranking = {key: hit[key] for key in ("score", "rerank_score") if key in hit}
+                result.append({**current, **ranking})
         return result
 
     def _ready_context(self, document_ids, favorites_only):
@@ -559,77 +579,103 @@ class RetrievalService:
             hits.append({**hit, "score": float(score)})
         return hits
 
+    def _semantic_search(self, query, document_ids, favorites_only, depth):
+        if not self.configured:
+            return [], "Semantic retrieval is not configured"
+        jobs, _ = self._ready_context(document_ids, favorites_only)
+        if not jobs:
+            return [], "Semantic indexes are not ready in this scope"
+        try:
+            index = self._ensure_vectors()
+            # Opening a missing store can invalidate readiness before a paid request.
+            jobs, documents = self._ready_context(document_ids, favorites_only)
+            if not jobs:
+                return [], "Semantic indexes are being restored"
+            vector = self.provider.embed([query], kind="query")[0]
+            candidate_limit = depth
+            while True:
+                points = index.query(vector, list(jobs), limit=candidate_limit)
+                semantic = self._hydrate(points, document_ids, favorites_only)
+                if (
+                    len(semantic) >= depth
+                    or len(points) < candidate_limit
+                    or candidate_limit >= 2048
+                ):
+                    break
+                candidate_limit = min(2048, candidate_limit * 2)
+        except (EmbeddingError, VectorIndexError, IndexError):
+            return [], "Semantic retrieval is temporarily unavailable"
+        warning = "Some semantic indexes are still pending" if len(jobs) < len(documents) else None
+        return semantic[:depth], warning
+
+    @staticmethod
+    def _fuse(lexical, semantic):
+        by_id, scores = {}, {}
+        for ranking in (lexical, semantic):
+            for rank, hit in enumerate(ranking, 1):
+                identifier = hit["chunk_id"]
+                by_id[identifier] = hit
+                scores[identifier] = scores.get(identifier, 0.0) + 1.0 / (60 + rank)
+        identifiers = sorted(by_id, key=lambda identifier: (-scores[identifier], identifier))
+        return [{**by_id[identifier], "score": scores[identifier]} for identifier in identifiers]
+
     def search(self, query, *, document_ids=None, favorites_only=False, limit=10, mode="hybrid"):
         query = query.strip()
         if not query or len(query) > 2000 or not 1 <= limit <= 50:
             raise LibraryError(422, "Provide a query and a result limit between 1 and 50")
-        if mode not in ("keyword", "hybrid"):
-            raise LibraryError(422, "Search mode must be keyword or hybrid")
+        if mode not in ("keyword", "vector", "hybrid"):
+            raise LibraryError(422, "Search mode must be keyword, vector or hybrid")
         if document_ids is not None and (
             not isinstance(document_ids, list)
             or len(document_ids) > 100
             or any(not isinstance(identifier, str) for identifier in document_ids)
         ):
             raise LibraryError(422, "Document scope must be a list of file IDs")
-        depth = max(20, limit * 3)
-        lexical = self.ingestion.search(
-            query,
-            document_ids=document_ids,
-            favorites_only=favorites_only,
-            limit=limit if mode == "keyword" else depth,
-        )
-        if mode == "keyword":
-            return lexical
-        warning = None
-        semantic = []
-        if not self.configured:
-            warning = "Semantic retrieval is not configured; keyword results are shown"
-        else:
-            jobs, documents = self._ready_context(document_ids, favorites_only)
-            if not jobs:
-                warning = "Semantic indexes are not ready in this scope; keyword results are shown"
-            else:
-                try:
-                    index = self._ensure_vectors()
-                    # Opening a missing/incomplete store can retire persisted
-                    # readiness records. Refresh before a paid query request.
-                    jobs, documents = self._ready_context(document_ids, favorites_only)
-                    if not jobs:
-                        raise VectorIndexError("Semantic indexes are being restored")
-                    vector = self.provider.embed([query], kind="query")[0]
-                    candidate_limit = depth
-                    while candidate_limit <= 2048:
-                        points = index.query(vector, list(jobs), limit=candidate_limit)
-                        semantic = self._hydrate(points, document_ids, favorites_only)
-                        if len(semantic) >= depth or len(points) < candidate_limit:
-                            break
-                        candidate_limit *= 2
-                    if len(jobs) < len(documents):
-                        warning = "Some semantic indexes are still pending; keyword retrieval covers available text"
-                except (EmbeddingError, VectorIndexError, IndexError):
-                    warning = (
-                        "Semantic retrieval is temporarily unavailable; keyword results are shown"
-                    )
-        if warning and not semantic:
-            return {
-                "mode": "keyword",
-                "hits": self._current_hits(lexical["hits"], document_ids, favorites_only)[:limit],
-                "warning": warning,
-            }
-        lexical["hits"] = self._current_hits(lexical["hits"], document_ids, favorites_only)
-        by_id, scores = {}, {}
-        for ranking in (lexical["hits"], semantic):
-            for rank, hit in enumerate(ranking, 1):
-                identifier = hit["chunk_id"]
-                by_id[identifier] = hit
-                scores[identifier] = scores.get(identifier, 0.0) + 1.0 / (60 + rank)
-        identifiers = sorted(by_id, key=lambda identifier: (-scores[identifier], identifier))[
-            :limit
-        ]
+        if document_ids == []:
+            return {"mode": mode, "hits": [], "warning": None, "reranked": False}
+
+        rerank_depth = self.config.rerank_candidates if self.reranker is not None else 0
+        result_depth = max(limit, rerank_depth)
+        recall_depth = result_depth if mode == "keyword" else max(20, limit * 3, result_depth)
+        warnings = []
+        lexical, semantic = [], []
+        if mode != "vector":
+            lexical = self.ingestion.search(
+                query,
+                document_ids=document_ids,
+                favorites_only=favorites_only,
+                limit=recall_depth,
+            )["hits"]
+        if mode != "keyword":
+            semantic, warning = self._semantic_search(
+                query, document_ids, favorites_only, recall_depth
+            )
+            if warning:
+                warnings.append(f"{warning}.")
+                if mode == "hybrid" and not semantic:
+                    mode = "keyword"
+                    warnings.append("Keyword results are shown.")
+                elif mode == "hybrid":
+                    warnings.append("Keyword retrieval covers available text.")
+
+        hits = self._fuse(lexical, semantic) if mode == "hybrid" else (lexical or semantic)
+        hits = self._current_hits(hits, document_ids, favorites_only)[:result_depth]
+        candidates = hits[:rerank_depth]
+        if self.reranker is not None and len(candidates) >= 2:
+            try:
+                scores = self.reranker.rerank(query, [hit["text"] for hit in candidates])
+                hits = [
+                    {**candidates[index], "rerank_score": score} for index, score in scores
+                ] + hits[rerank_depth:]
+            except RerankError as error:
+                warnings.append(f"{error}. Initial ranking is shown.")
+            # A mutation can race the provider call. Never return a stale or out-of-scope passage.
+            hits = self._current_hits(hits, document_ids, favorites_only)
+
+        hits = hits[:limit]
         return {
-            "mode": "hybrid",
-            "hits": [
-                {**by_id[identifier], "score": scores[identifier]} for identifier in identifiers
-            ],
-            "warning": warning,
+            "mode": mode,
+            "hits": hits,
+            "warning": " ".join(warnings) or None,
+            "reranked": any("rerank_score" in hit for hit in hits),
         }

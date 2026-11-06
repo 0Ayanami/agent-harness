@@ -18,7 +18,7 @@ copied exactly; adapted components retain the existing rendering implementation.
 | `src/components/ui/badge.tsx` | same relative path | Unchanged layer badges and colors. |
 | `src/components/ui/tabs.tsx` | same relative path | Unchanged. Used for conversation/trace and project state. |
 | `src/components/layout/header.tsx` | same relative path | Shows AYANAMI, workbench and library navigation, language and theme controls, and the project repository link. |
-| `src/components/layout/sidebar.tsx` | same relative path | Groups workbench and library links in a collapsible Workspace section alongside the session list. |
+| `src/components/layout/sidebar.tsx` | same relative path | Shows a collapsible Skills browser alongside the session list. |
 | `src/components/simulator/simulator-message.tsx` | same relative path | Retains original icons, message type colors, borders, and motion. Localizes labels, preserves whitespace, and receives only actual runtime messages and tool events. |
 | `src/lib/utils.ts` | same relative path | Unchanged. |
 | `src/lib/constants.ts` | same relative path | Unchanged chapter navigation metadata; no generated course source/document data. |

@@ -27,6 +27,8 @@ export interface RetrievalStatus {
   configured: boolean;
   model: string;
   dimensions: number;
+  rerank_configured?: boolean;
+  rerank_model?: string | null;
   [key: string]: unknown;
 }
 
@@ -65,10 +67,13 @@ export interface LibrarySearchHit {
   score: number;
 }
 
+export type LibraryRetrievalMode = "keyword" | "vector" | "hybrid";
+
 export interface LibrarySearchResults {
-  mode: "keyword" | "hybrid";
+  mode: LibraryRetrievalMode;
   hits: LibrarySearchHit[];
   warning: string | null;
+  reranked?: boolean;
 }
 
 export type LibrarySort = "updated_desc" | "name_asc" | "size_desc";
@@ -76,7 +81,7 @@ export type LibraryView = "all" | "favorites" | "recent";
 
 export interface LibraryFilters {
   query: string;
-  mode: "filename" | "content" | "hybrid";
+  mode: "filename" | "content" | "vector" | "hybrid";
   view: LibraryView;
   extension: string;
   sort: LibrarySort;

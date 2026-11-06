@@ -6,6 +6,27 @@ from datetime import datetime
 import yaml
 
 
+def parse_skill_frontmatter(text: str) -> tuple[dict, str]:
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        return ({}, text)
+    closing_index = next(
+        (index for index, line in enumerate(lines[1:], start=1) if line.rstrip("\r\n") == "---"),
+        None,
+    )
+    if closing_index is None:
+        return ({}, text)
+    frontmatter = "".join(lines[1:closing_index])
+    body = "".join(lines[closing_index + 1 :]).strip()
+    try:
+        meta = yaml.safe_load(frontmatter) or {}
+    except yaml.YAMLError:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return (meta, body)
+
+
 class ContextService:
     def __init__(self, config, state_dir, memory, gateway):
         self.config = config
@@ -21,30 +42,6 @@ class ContextService:
         self.SKILL_REGISTRY: dict[str, dict] = {}
         self.scan_skills()
 
-    def _parse_frontmatter(self, text: str) -> tuple[dict, str]:
-        lines = text.splitlines(keepends=True)
-        if not lines or lines[0].rstrip("\r\n") != "---":
-            return ({}, text)
-        closing_index = next(
-            (
-                index
-                for index, line in enumerate(lines[1:], start=1)
-                if line.rstrip("\r\n") == "---"
-            ),
-            None,
-        )
-        if closing_index is None:
-            return ({}, text)
-        frontmatter = "".join(lines[1:closing_index])
-        body = "".join(lines[closing_index + 1 :]).strip()
-        try:
-            meta = yaml.safe_load(frontmatter) or {}
-        except yaml.YAMLError:
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
-        return (meta, body)
-
     def scan_skills(self):
         self.SKILL_REGISTRY.clear()
         if not self.SKILLS_DIR.exists():
@@ -59,7 +56,7 @@ class ContextService:
             if not manifest.resolve().is_relative_to(skills_root):
                 continue
             raw = manifest.read_text(encoding="utf-8")
-            meta, body = self._parse_frontmatter(raw)
+            meta, body = parse_skill_frontmatter(raw)
             raw_name = meta.get("name")
             name = raw_name.strip() if isinstance(raw_name, str) else ""
             name = name or directory.name

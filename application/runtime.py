@@ -278,7 +278,7 @@ class AgentRuntime:
             "tasks": [asdict(task) for task in self.tasks.list_tasks()],
             "todos": self.tasks.CURRENT_TODOS,
             "teammates": dict(self.coordination.active_teammates),
-            "crons": [asdict(job) for job in self.scheduler.scheduled_jobs.values()],
+            "crons": self.scheduler.list_jobs(),
             "memory_catalog": self.memory.read_memory_index() if self._memory_allowed() else "",
         }
 

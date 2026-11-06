@@ -1,5 +1,5 @@
 import { API_PREFIX } from "./agent-api";
-import type { LibraryFile, LibraryFilters, LibraryIngestionJob, LibraryListing, LibraryPreview, LibrarySearchHit, LibrarySearchResults, RetrievalStatus } from "@/types/library";
+import type { LibraryFile, LibraryFilters, LibraryIngestionJob, LibraryListing, LibraryPreview, LibraryRetrievalMode, LibrarySearchHit, LibrarySearchResults, RetrievalStatus } from "@/types/library";
 
 const root = `${API_PREFIX}/library/files`;
 export const MAX_LIBRARY_FILE_SIZE = 25 * 1024 * 1024;
@@ -46,7 +46,7 @@ export const libraryContentUrl = (id: string, download = true, versionId?: strin
 export const reindexLibraryFile = (id: string) => request<LibraryIngestionJob>(`${root}/${encodeURIComponent(id)}/reindex`, { method: "POST" });
 export const getLibraryChunk = (id: string, chunkId: string, signal?: AbortSignal) => request<LibrarySearchHit>(`${root}/${encodeURIComponent(id)}/chunks/${encodeURIComponent(chunkId)}`, { signal });
 
-export function searchLibraryContent(query: string, favoritesOnly: boolean, signal: AbortSignal, mode: "keyword" | "hybrid" = "keyword") {
+export function searchLibraryContent(query: string, favoritesOnly: boolean, signal: AbortSignal, mode: LibraryRetrievalMode = "keyword") {
   return request<LibrarySearchResults>(`${API_PREFIX}/library/search`, {
     method: "POST", body: JSON.stringify({ query, favorites_only: favoritesOnly, limit: 20, mode }), signal,
   });

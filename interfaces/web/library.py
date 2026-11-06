@@ -23,7 +23,7 @@ class LibrarySearch(BaseModel):
     document_ids: list[str] | None = Field(default=None, max_length=100)
     favorites_only: StrictBool = False
     limit: int = Field(default=10, ge=1, le=50)
-    mode: Literal["keyword", "hybrid"] = "keyword"
+    mode: Literal["keyword", "vector", "hybrid"] = "keyword"
 
 
 class LibraryFileResponse(FileResponse):
@@ -59,10 +59,10 @@ def library_router(service, require_local_client, *, retrieval=None):
     def search_library(body: LibrarySearch):
         arguments = body.model_dump()
         mode = arguments.pop("mode")
-        if mode == "hybrid":
-            if retrieval is None:
-                raise HTTPException(503, "Semantic retrieval is not configured")
+        if retrieval is not None:
             return invoke(retrieval.search, **arguments, mode=mode)
+        if mode != "keyword":
+            raise HTTPException(503, "Semantic retrieval is not configured")
         return invoke(ingestion_service().search, **arguments)
 
     @router.get("/retrieval")

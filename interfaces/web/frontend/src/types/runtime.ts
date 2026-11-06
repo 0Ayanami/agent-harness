@@ -1,11 +1,11 @@
 import type { SimStep } from "@/types/agent-data";
-import type { LibraryLocation } from "./library";
+import type { LibraryLocation, LibraryRetrievalMode } from "./library";
 
 export interface LibraryQuestion {
   enabled: boolean;
   document_ids: string[] | null;
   favorites_only: boolean;
-  mode: "hybrid" | "keyword";
+  mode: LibraryRetrievalMode;
 }
 
 export interface LibrarySource {
@@ -23,6 +23,7 @@ export interface LibraryRetrieval {
   run_id: string;
   mode: string;
   warning: string | null;
+  reranked?: boolean;
   sources: LibrarySource[];
 }
 

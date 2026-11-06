@@ -45,6 +45,11 @@ function eventMessage(event: RuntimeEvent): RuntimeMessage | null {
       annotation: "",
     } };
   }
+  if (kind === "scheduled") {
+    return { id: `event-${id}`, trace: false, step: {
+      type: "system_event", content: value(payload, "prompt"), annotation: "scheduledTriggered",
+    } };
+  }
   if (kind === "error" || kind === "subagent_started" || kind === "subagent_finished" ||
       (kind === "run_finished" && payload.outcome !== "completed")) {
     const text = kind === "error" ? value(payload, "message") :
@@ -79,7 +84,8 @@ function applyEvent(view: SessionView, event: RuntimeEvent, replay = false): Ses
   if (entry) next.messages = [...next.messages, entry];
   if (event.kind === "library_retrieval") {
     next.retrieval = { run_id: value(event.payload, "run_id"), mode: value(event.payload, "mode"),
-      warning: value(event.payload, "warning") || null, sources: sourceList(event.payload.sources) };
+      warning: value(event.payload, "warning") || null, sources: sourceList(event.payload.sources),
+      reranked: typeof event.payload.reranked === "boolean" ? event.payload.reranked : undefined };
   }
   if (event.kind === "library_answer") {
     const runId = value(event.payload, "run_id");
@@ -185,7 +191,7 @@ export function useAgentSession() {
       // history/cursor are not an atomic read while a worker is running. Rebuilding
       // messages from events avoids skipping a newly emitted assistant response.
       // Snapshot remains authoritative for already-resolved approvals after restart.
-      const hasTranscript = events.some((event) => event.kind === "user" || event.kind === "assistant");
+      const hasTranscript = events.some((event) => event.kind === "user" || event.kind === "assistant" || event.kind === "scheduled");
       let restored: SessionView = {
         snapshot, messages: hasTranscript ? [] : historyMessages(snapshot), approvals: snapshot.approvals,
         busy: snapshot.status === "running", cancelling: false, cursor: snapshot.cursor,

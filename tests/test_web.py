@@ -45,7 +45,7 @@ def test_api_metadata_and_health(web):
         {"enabled": True, "document_id": "selected"},
         {"enabled": True, "favorites_only": "true"},
         {"enabled": True, "document_ids": [""]},
-        {"enabled": True, "mode": "vector"},
+        {"enabled": True, "mode": "unsupported"},
     ],
 )
 def test_invalid_library_options_cannot_launch_a_turn(web, library):

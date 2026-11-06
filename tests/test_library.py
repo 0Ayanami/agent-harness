@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from agent_harness import HarnessConfig
 from agent_harness.interfaces.web.app import create_app
-from test_services import FakeClient
+from test_services import FakeClient, wait_until
 
 HEADERS = {"X-Agent-Client": "web"}
 FILES = "/api/library/files"
@@ -343,10 +343,14 @@ def test_invalid_pdf_range_does_not_keep_replaced_or_deleted_original_alive(libr
         f"{endpoint}/content", headers=HEADERS, files={"file": ("新原件.pdf", updated)}
     )
     assert result.status_code == 200, result.text
-    assert result.json()["version_id"] != record["version_id"]
+    version_id = result.json()["version_id"]
+    assert version_id != record["version_id"]
+    wait_until(lambda: [path.parent.name for path in original_files(config)] == [version_id])
     assert [path.read_bytes() for path in original_files(config)] == [updated]
     assert browser.delete(endpoint, headers=HEADERS).status_code == 204
-    assert original_files(config) == []
+    assert browser.get(endpoint).status_code == 404
+    # Ingestion may still be reading the replacement. Its lease releases the file.
+    wait_until(lambda: not original_files(config))
 
 
 def test_replace_database_failure_preserves_published_version_and_removes_new_blob(

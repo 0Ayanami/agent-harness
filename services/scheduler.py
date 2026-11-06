@@ -2,8 +2,9 @@ import json
 import os
 import random
 import threading
-from datetime import datetime
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import datetime, timedelta
+
 from ..core.models import CronJob
 
 
@@ -19,6 +20,7 @@ class Scheduler:
         self.cron_queue: list[CronJob] = []
         self.cron_lock = threading.RLock()
         self._last_fired: dict[str, str] = {}
+        self._due_generation = 0
         self._runtime_services_started = False
         self._runtime_services_lock = threading.Lock()
 
@@ -40,13 +42,17 @@ class Scheduler:
         if len(fields) != 5:
             return False
         minute, hour, dom, month, dow = fields
+        return (
+            self._cron_field_matches(minute, dt.minute)
+            and self._cron_field_matches(hour, dt.hour)
+            and self._cron_date_matches(dom, month, dow, dt)
+        )
+
+    def _cron_date_matches(self, dom, month, dow, dt):
         dow_val = (dt.weekday() + 1) % 7
-        m = self._cron_field_matches(minute, dt.minute)
-        h = self._cron_field_matches(hour, dt.hour)
         dom_ok = self._cron_field_matches(dom, dt.day)
-        month_ok = self._cron_field_matches(month, dt.month)
         dow_ok = self._cron_field_matches(dow, dow_val)
-        if not (m and h and month_ok):
+        if not self._cron_field_matches(month, dt.month):
             return False
         if dom == "*" and dow == "*":
             return True
@@ -56,12 +62,33 @@ class Scheduler:
             return dom_ok
         return dom_ok or dow_ok
 
+    def next_cron_run(self, cron_expr, now, last_fired=None):
+        minute, hour, dom, month, dow = cron_expr.split()
+        minutes = [value for value in range(60) if self._cron_field_matches(minute, value)]
+        hours = [value for value in range(24) if self._cron_field_matches(hour, value)]
+        if not minutes or not hours:
+            return None
+        start = now.replace(second=0, microsecond=0)
+        # Gregorian leap days can be eight years apart around a skipped century.
+        for offset in range(8 * 366 + 1):
+            day = start + timedelta(days=offset)
+            if not self._cron_date_matches(dom, month, dow, day):
+                continue
+            for hour_value in hours:
+                for minute_value in minutes:
+                    candidate = day.replace(hour=hour_value, minute=minute_value)
+                    if candidate < start or candidate.strftime("%Y-%m-%d %H:%M") == last_fired:
+                        continue
+                    if datetime.fromtimestamp(candidate.timestamp()) == candidate:
+                        return max(now, candidate)
+        return None
+
     def _validate_cron_field(self, field: str, lo: int, hi: int) -> str | None:
         if field == "*":
             return None
         if field.startswith("*/"):
             step = field[2:]
-            if not step.isdigit() or int(step) <= 0:
+            if not (step.isascii() and step.isdecimal()) or int(step) <= 0:
                 return f"Invalid step: {field}"
             return None
         if "," in field:
@@ -72,7 +99,7 @@ class Scheduler:
             return None
         if "-" in field:
             left, right = field.split("-", 1)
-            if not left.isdigit() or not right.isdigit():
+            if not (left.isascii() and left.isdecimal() and right.isascii() and right.isdecimal()):
                 return f"Invalid range: {field}"
             a, b = (int(left), int(right))
             if a < lo or a > hi or b < lo or (b > hi):
@@ -80,7 +107,7 @@ class Scheduler:
             if a > b:
                 return f"Range start > end: {field}"
             return None
-        if not field.isdigit():
+        if not (field.isascii() and field.isdecimal()):
             return f"Invalid field: {field}"
         value = int(field)
         if value < lo or value > hi:
@@ -106,18 +133,67 @@ class Scheduler:
             temporary.write_text(json.dumps(durable, indent=2), encoding="utf-8")
             os.replace(temporary, self.DURABLE_PATH)
 
-    def load_durable_jobs(self):
-        if not self.DURABLE_PATH.exists():
-            return
+    def read_durable_jobs(self):
         try:
-            for item in json.loads(self.DURABLE_PATH.read_text(encoding="utf-8")):
+            items = json.loads(self.DURABLE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        jobs = []
+        for item in items if isinstance(items, list) else []:
+            try:
                 job = CronJob(**item)
-                if not self.validate_cron(job.cron):
-                    self.scheduled_jobs[job.id] = job
-                    if job.pending_delivery:
-                        self.cron_queue.append(job)
-        except Exception:
-            pass
+                if (
+                    job.durable is True
+                    and type(job.recurring) is bool
+                    and type(job.pending_delivery) is bool
+                    and isinstance(job.id, str)
+                    and isinstance(job.prompt, str)
+                    and not self.validate_cron(job.cron)
+                ):
+                    jobs.append(job)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return jobs
+
+    def load_durable_jobs(self):
+        with self.cron_lock:
+            for job in self.read_durable_jobs():
+                self.scheduled_jobs[job.id] = job
+                if job.pending_delivery:
+                    self.cron_queue.append(job)
+
+    def list_jobs(self):
+        with self.cron_lock:
+            return [asdict(job) for job in self.scheduled_jobs.values()]
+
+    def describe_jobs(self, now, job_id=None):
+        with self.cron_lock:
+            queued = {job.id for job in self.cron_queue}
+            jobs = [
+                (replace(job), self._last_fired.get(job.id))
+                for job in self.scheduled_jobs.values()
+                if job_id is None or job.id == job_id
+            ]
+        items = []
+        for job, last_fired in jobs:
+            waiting = job.pending_delivery or job.id in queued
+            next_run = None if waiting else self.next_cron_run(job.cron, now, last_fired)
+            items.append(
+                {
+                    **asdict(job),
+                    "status": "queued" if waiting else "scheduled",
+                    "next_run_at": next_run.astimezone().isoformat() if next_run else None,
+                }
+            )
+        return items
+
+    def due_generation(self):
+        with self.cron_lock:
+            return self._due_generation
+
+    def has_new_due_job(self, since):
+        with self.cron_lock:
+            return self._due_generation > since and bool(self.cron_queue)
 
     def schedule_job(
         self, cron: str, prompt: str, recurring: bool = True, durable: bool = True
@@ -125,28 +201,37 @@ class Scheduler:
         err = self.validate_cron(cron)
         if err:
             return err
-        job = CronJob(
-            id=f"cron_{random.randint(0, 999999):06d}",
-            cron=cron,
-            prompt=prompt,
-            recurring=recurring,
-            durable=durable,
-        )
         with self.cron_lock:
+            job_id = f"cron_{random.randint(0, 999999):06d}"
+            while job_id in self.scheduled_jobs:
+                job_id = f"cron_{random.randint(0, 999999):06d}"
+            job = CronJob(job_id, cron, prompt, recurring, durable)
             self.scheduled_jobs[job.id] = job
-            if durable:
-                self.save_durable_jobs()
+            try:
+                if durable:
+                    self.save_durable_jobs()
+            except OSError:
+                self.scheduled_jobs.pop(job.id)
+                raise
         return job
 
-    def cancel_job(self, job_id: str) -> str:
+    def remove_job(self, job_id: str) -> bool:
         with self.cron_lock:
             job = self.scheduled_jobs.pop(job_id, None)
+            if job is None:
+                return False
+            try:
+                if job.durable:
+                    self.save_durable_jobs()
+            except OSError:
+                self.scheduled_jobs[job.id] = job
+                raise
             self.cron_queue[:] = [queued for queued in self.cron_queue if queued.id != job_id]
-            if job and job.durable:
-                self.save_durable_jobs()
-        if not job:
-            return f"Job {job_id} not found"
-        return f"Cancelled {job_id}"
+            self._last_fired.pop(job_id, None)
+            return True
+
+    def cancel_job(self, job_id: str) -> str:
+        return f"Cancelled {job_id}" if self.remove_job(job_id) else f"Job {job_id} not found"
 
     def _enqueue_due_job(self, job: CronJob):
         """Persist a one-shot delivery before exposing it through the queue."""
@@ -159,6 +244,7 @@ class Scheduler:
                 job.pending_delivery = False
                 raise
         self.cron_queue.append(job)
+        self._due_generation += 1
 
     def cron_scheduler_loop(self):
         while not self.stop_event.wait(1):
@@ -215,13 +301,12 @@ class Scheduler:
         return f"Scheduled {result.id}: '{cron}' -> {prompt}"
 
     def run_list_crons(self) -> str:
-        with self.cron_lock:
-            jobs = list(self.scheduled_jobs.values())
+        jobs = self.list_jobs()
         if not jobs:
             return "No cron jobs."
         return "\n".join(
             (
-                f"  {job.id}: '{job.cron}' -> {job.prompt[:40]} [{('recurring' if job.recurring else 'one-shot')}, {('durable' if job.durable else 'session')}]"
+                f"  {job['id']}: '{job['cron']}' -> {job['prompt'][:40]} [{('recurring' if job['recurring'] else 'one-shot')}, {('durable' if job['durable'] else 'session')}]"
                 for job in jobs
             )
         )

@@ -17,6 +17,7 @@ from ...services.ingestion import IngestionService
 from ...services.library import LibraryService
 from ...services.retrieval import RetrievalService
 from .library import library_router
+from .skills import skills_router
 
 
 class LibraryOptions(BaseModel):
@@ -24,7 +25,7 @@ class LibraryOptions(BaseModel):
     enabled: StrictBool = False
     document_ids: list[str] | None = Field(default=None, max_length=100)
     favorites_only: StrictBool = False
-    mode: Literal["hybrid", "keyword"] = "hybrid"
+    mode: Literal["hybrid", "keyword", "vector"] = "hybrid"
 
 
 class MessageRequest(BaseModel):
@@ -49,6 +50,14 @@ class SessionPatch(BaseModel):
     temporary: StrictBool | None = None
 
 
+class ScheduledTaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cron_expr: str = Field(min_length=1, max_length=120)
+    prompt: str = Field(min_length=1, max_length=30000)
+    recurring: StrictBool = True
+    persistent: StrictBool = True
+
+
 def require_local_client(request: Request, x_agent_client: str = Header(default="")):
     if x_agent_client != "web":
         raise HTTPException(403, "X-Agent-Client header is required")
@@ -64,7 +73,7 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
         library, cache_dir=config.workdir / ".artifacts" / "cache" / "jieba"
     )
     retrieval = RetrievalService(config, library, ingestion)
-    application = SessionService(config, client_factory, retrieval=retrieval)
+    application = SessionService(config, client_factory, retrieval=retrieval, resume_schedules=True)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -141,6 +150,43 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
     )
     def delete_session(session_id: str):
         session_operation(application.delete, session_id)
+        return Response(status_code=204)
+
+    @router.get("/scheduled-tasks")
+    def list_scheduled_tasks():
+        return application.scheduled_tasks()
+
+    @router.get("/sessions/{session_id}/scheduled-tasks")
+    def list_session_scheduled_tasks(session_id: str):
+        return session_operation(application.scheduled_tasks, session_id)
+
+    @router.post(
+        "/sessions/{session_id}/scheduled-tasks",
+        status_code=201,
+        dependencies=[Depends(require_local_client)],
+    )
+    def create_scheduled_task(session_id: str, body: ScheduledTaskCreate):
+        try:
+            return session_operation(
+                application.create_scheduled_task, session_id, **body.model_dump()
+            )
+        except ValueError as error:
+            raise HTTPException(422, str(error)) from error
+        except OSError:
+            raise HTTPException(503, "Could not save scheduled task") from None
+
+    @router.delete(
+        "/sessions/{session_id}/scheduled-tasks/{job_id}",
+        status_code=204,
+        dependencies=[Depends(require_local_client)],
+    )
+    def delete_scheduled_task(session_id: str, job_id: str):
+        try:
+            deleted = session_operation(application.delete_scheduled_task, session_id, job_id)
+        except OSError:
+            raise HTTPException(503, "Could not remove scheduled task") from None
+        if not deleted:
+            raise HTTPException(404, "Scheduled task not found")
         return Response(status_code=204)
 
     @router.post(
@@ -225,6 +271,7 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
         )
 
     router.include_router(library_router(library, require_local_client, retrieval=retrieval))
+    router.include_router(skills_router(config.workdir))
     app.include_router(router, prefix="/api")
     app.include_router(router, prefix="/api/agent", include_in_schema=False)
     if frontend_directory is not None:

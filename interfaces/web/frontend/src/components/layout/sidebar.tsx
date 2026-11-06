@@ -1,13 +1,12 @@
 "use client";
 
-import Link from "next/link";
-import { usePathname } from "next/navigation";
 import { useState } from "react";
 import { LibraryDialog } from "@/components/library/library-dialog";
-import { useLocale, useTranslations } from "@/lib/i18n";
+import { useTranslations } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
-import { Archive, ArchiveRestore, LayoutDashboard, LibraryBig, MessageSquare, Plus, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, CalendarClock, MessageSquare, Plus, Trash2 } from "lucide-react";
 import type { SessionInfo } from "@/types/runtime";
+import { SkillExplorer } from "./skill-explorer";
 
 interface SidebarProps {
   sessions: SessionInfo[];
@@ -17,21 +16,16 @@ interface SidebarProps {
   busy: boolean;
   onSelect: (sessionId: string) => void;
   onCreate: () => void;
+  onOpenScheduledTasks: () => void;
   onArchiveChange: (sessionId: string, archived: boolean) => Promise<boolean>;
   onDelete: (sessionId: string) => Promise<boolean>;
 }
 
-export function Sidebar({ sessions, archivedSessions, selectedId, loading, busy, onSelect, onCreate, onArchiveChange, onDelete }: SidebarProps) {
-  const locale = useLocale();
+export function Sidebar({ sessions, archivedSessions, selectedId, loading, busy, onSelect, onCreate, onOpenScheduledTasks, onArchiveChange, onDelete }: SidebarProps) {
   const runtime = useTranslations("runtime");
-  const library = useTranslations("library");
-  const pathname = usePathname().replace(/\/$/, "");
+  const schedule = useTranslations("schedule");
   const [deleteTarget, setDeleteTarget] = useState<SessionInfo | null>(null);
   const [deleteFailed, setDeleteFailed] = useState(false);
-  const destinations = [
-    { href: `/${locale}/`, label: runtime("workbench"), icon: LayoutDashboard },
-    { href: `/${locale}/library/`, label: library("title"), icon: LibraryBig },
-  ];
   const listClass = "flex max-h-56 gap-1 overflow-auto md:block md:space-y-0.5";
   const actionClass = "flex min-h-9 min-w-9 shrink-0 items-center justify-center rounded-md text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-secondary)] disabled:opacity-40";
 
@@ -73,6 +67,10 @@ export function Sidebar({ sessions, archivedSessions, selectedId, loading, busy,
             className="flex min-h-11 w-full items-center justify-center gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)] px-3 text-sm font-medium transition-colors hover:bg-zinc-200 disabled:opacity-50 dark:hover:bg-zinc-800">
             <Plus size={15} /> {runtime("newSession")}
           </button>
+          <button type="button" data-testid="scheduled-tasks-open" aria-haspopup="dialog" onClick={onOpenScheduledTasks}
+            className="mt-2 flex min-h-10 w-full items-center gap-2 rounded-lg px-3 text-left text-sm font-medium text-[var(--color-text-secondary)] hover:bg-[var(--color-bg-secondary)]">
+            <CalendarClock size={16} className="shrink-0" />{schedule("title")}
+          </button>
           <div className="mb-2 mt-5 flex items-center justify-between text-[11px] font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-500">
             <span>{runtime("sessions")}</span><span id="session-count">{sessions.length}</span>
           </div>
@@ -91,31 +89,7 @@ export function Sidebar({ sessions, archivedSessions, selectedId, loading, busy,
             </div>
           </details>
         </nav>
-        <details data-testid="workspace-menu" className="hidden border-t border-[var(--color-border)] pt-4 md:block">
-          <summary className="cursor-pointer rounded-md py-1 text-xs font-semibold text-[var(--color-text-secondary)]">{runtime("workspace")}</summary>
-          <nav aria-label={runtime("workspace")} className="mt-2">
-            <ul className="space-y-0.5">
-              {destinations.map(({ href, label, icon: Icon }) => {
-                const active = pathname === href.replace(/\/$/, "");
-                return (
-                  <li key={href}>
-                    <Link
-                      href={href}
-                      aria-current={active ? "page" : undefined}
-                      className={cn(
-                        "flex min-h-10 items-center gap-2 rounded-md px-2.5 py-1.5 text-sm transition-colors",
-                        active ? "bg-zinc-100 font-medium text-zinc-900 dark:bg-zinc-800 dark:text-white" : "text-zinc-500 hover:bg-zinc-50 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800/50 dark:hover:text-zinc-300"
-                      )}
-                    >
-                      <Icon size={15} className="shrink-0" />
-                      <span>{label}</span>
-                    </Link>
-                  </li>
-                );
-              })}
-            </ul>
-          </nav>
-        </details>
+        <SkillExplorer />
       </div>
       {deleteTarget && <LibraryDialog titleId="delete-conversation-title" testId="delete-conversation-dialog"
         busy={loading} onClose={() => setDeleteTarget(null)}>

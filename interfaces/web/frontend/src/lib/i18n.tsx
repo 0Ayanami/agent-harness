@@ -6,6 +6,8 @@ import ja from "@/i18n/messages/ja.json";
 import { runtimeMessages } from "@/i18n/runtime-messages";
 import { libraryMessages } from "@/i18n/library-messages";
 import { ragMessages } from "@/i18n/rag-messages";
+import { skillMessages } from "@/i18n/skill-messages";
+import { scheduleMessages } from "@/i18n/schedule-messages";
 
 type Messages = typeof en;
 
@@ -28,6 +30,12 @@ export function I18nProvider({ locale, children }: { locale: string; children: R
 export function useTranslations(namespace?: string) {
   const { locale, messages } = useContext(I18nContext);
   return (key: string) => {
+    if (namespace === "schedule") {
+      return scheduleMessages[locale]?.[key] || scheduleMessages.en[key] || key;
+    }
+    if (namespace === "skills") {
+      return skillMessages[locale]?.[key] || skillMessages.en[key] || key;
+    }
     if (namespace === "rag") {
       return ragMessages[locale]?.[key] || ragMessages.en[key] || key;
     }

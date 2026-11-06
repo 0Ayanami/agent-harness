@@ -11,6 +11,7 @@ import pytest
 
 from agent_harness import HarnessConfig
 from agent_harness.infrastructure.embeddings import BailianEmbeddings, EmbeddingError
+from agent_harness.infrastructure.reranking import BailianReranker, RerankError
 from agent_harness.services.ingestion import IngestionService
 from agent_harness.services.library import LibraryError, LibraryService
 from agent_harness.services.retrieval import RetrievalService
@@ -25,6 +26,90 @@ def embedding_config(workdir):
         embedding_base_url="https://embedding.example.test/compatible-mode/v1",
         embedding_dimensions=3,
     )
+
+
+RERANK_ENDPOINT = "https://rank.example.test/api/v1/services/rerank/text-rerank/text-rerank"
+
+
+def rerank_config(config, **settings):
+    return replace(
+        config, rerank_api_key="rank-test-secret", rerank_base_url=RERANK_ENDPOINT, **settings
+    )
+
+
+def test_dashscope_rerank_contract_and_deterministic_order(tmp_path):
+    def send(request):
+        assert str(request.url) == RERANK_ENDPOINT
+        assert request.headers["authorization"] == "Bearer rank-test-secret"
+        assert json.loads(request.content) == {
+            "model": "qwen3-rerank",
+            "input": {"query": "filter", "documents": ["alpha", "bravo", "charlie"]},
+            "parameters": {"top_n": 3},
+        }
+        return httpx.Response(
+            200,
+            json={
+                "output": {
+                    "results": [
+                        {"index": 2, "relevance_score": 0.9},
+                        {"index": 0, "relevance_score": 0.1},
+                        {"index": 1, "relevance_score": 0.9},
+                    ]
+                }
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(send)) as client:
+        reranker = BailianReranker(rerank_config(embedding_config(tmp_path)), client=client)
+        assert reranker.rerank("filter", ["alpha", "bravo", "charlie"]) == [
+            (1, 0.9),
+            (2, 0.9),
+            (0, 0.1),
+        ]
+        assert "rank-test-secret" not in repr(reranker)
+
+
+@pytest.mark.parametrize(
+    "status,body,diagnostic",
+    [
+        (401, {"message": "provider echoed rank-test-secret"}, "HTTP 401"),
+        (200, [{"message": "rank-test-secret"}], "invalid result"),
+        (200, {"output": {"results": [{"index": 0, "relevance_score": 0.1}]}}, "invalid result"),
+        (
+            200,
+            {
+                "output": {
+                    "results": [
+                        {"index": 0, "relevance_score": 0.5},
+                        {"index": 0, "relevance_score": 0.4},
+                    ]
+                }
+            },
+            "invalid result",
+        ),
+        (
+            200,
+            {
+                "output": {
+                    "results": [
+                        {"index": 0, "relevance_score": 0.5},
+                        {"index": 1, "relevance_score": True},
+                    ]
+                }
+            },
+            "invalid result",
+        ),
+    ],
+)
+def test_dashscope_rerank_rejects_untrusted_results(tmp_path, status, body, diagnostic):
+    def send(_):
+        return httpx.Response(status, json=body)
+
+    with httpx.Client(transport=httpx.MockTransport(send)) as client:
+        reranker = BailianReranker(rerank_config(embedding_config(tmp_path)), client=client)
+        with pytest.raises(RerankError, match=diagnostic) as failure:
+            reranker.rerank("filter", ["alpha", "bravo"])
+        assert "rank-test-secret" not in str(failure.value)
 
 
 def test_embedding_http_batches_and_restores_response_order(tmp_path):
@@ -135,8 +220,8 @@ def library_components(tmp_path):
 
 
 @contextmanager
-def running_retrieval(components, provider):
-    retrieval = RetrievalService(*components, embedding_client=provider)
+def running_retrieval(components, provider, **options):
+    retrieval = RetrievalService(*components, embedding_client=provider, **options)
     retrieval.start()
     try:
         yield retrieval
@@ -165,7 +250,7 @@ def test_real_qdrant_hybrid_lookup_fusion_scope_and_reopen(library_components):
         for document in (primary, other):
             assert wait_vector(library, document["id"])["chunk_count"] == 1
         keyword = retrieval.search("spacecraft", mode="keyword")
-        assert keyword == {"mode": "keyword", "hits": [], "warning": None}
+        assert keyword == {"mode": "keyword", "hits": [], "warning": None, "reranked": False}
         assert provider.query_calls == []
         hybrid = retrieval.search("spacecraft", limit=1)
         assert hybrid["mode"] == "hybrid" and hybrid["warning"] is None
@@ -219,6 +304,9 @@ def test_retry_and_explicit_keyword_fallback(library_components):
         result = retrieval.search("orbital")
         assert result["mode"] == "keyword" and "not configured" in result["warning"]
         assert result["hits"][0]["document_id"] == record["id"]
+        strict = retrieval.search("orbital", mode="vector")
+        assert strict["mode"] == "vector" and "not configured" in strict["warning"]
+        assert strict["hits"] == []
         assert not provider.document_calls and not provider.query_calls
         assert not (config.data_dir / "library" / "vectors").exists()
     provider.fail_document = True
@@ -235,6 +323,122 @@ def test_retry_and_explicit_keyword_fallback(library_components):
         result = retrieval.search("orbital")
         assert result["mode"] == "keyword" and "temporarily unavailable" in result["warning"]
         assert result["hits"][0]["document_id"] == record["id"]
+        strict = retrieval.search("orbital", mode="vector")
+        assert strict["mode"] == "vector" and "temporarily unavailable" in strict["warning"]
+        assert strict["hits"] == []
+
+
+def test_model_reranks_before_top_k_in_each_scoped_retrieval_mode(library_components, monkeypatch):
+    config, library, ingestion = library_components
+    config = rerank_config(config, rerank_candidates=2)
+    provider = FixedEmbeddings()
+    documents = [
+        upload(library, f"passage-{index}.txt", f"Orbital shuttle maintenance passage {index}.")
+        for index in range(4)
+    ]
+    for document in documents[:3]:
+        library.patch(document["id"], favorite=True)
+    permitted = {document["id"] for document in documents[:3]}
+    sent = []
+    fail = False
+
+    def send(request):
+        candidates = json.loads(request.content)["input"]["documents"]
+        sent.append(candidates)
+        if fail:
+            raise httpx.ReadTimeout("provider diagnostic rank-test-secret", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "output": {
+                    "results": [
+                        {"index": 1, "relevance_score": 0.9},
+                        {"index": 0, "relevance_score": 0.1},
+                    ]
+                }
+            },
+        )
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(send)) as client,
+        running_retrieval(
+            (config, library, ingestion), provider, rerank_client=client
+        ) as retrieval,
+    ):
+        for document in documents:
+            wait_vector(library, document["id"])
+        assert retrieval.status()["rerank_configured"]
+        assert retrieval.status()["rerank_model"] == "qwen3-rerank"
+        for mode in ("keyword", "hybrid", "vector"):
+            result = retrieval.search("shuttle", favorites_only=True, mode=mode, limit=1)
+            assert result["mode"] == mode and result["reranked"] and not result["warning"]
+            assert len(sent[-1]) == 2 and all("passage 3" not in text for text in sent[-1])
+            [hit] = result["hits"]
+            assert hit["text"] == sent[-1][1] and hit["rerank_score"] == 0.9
+            assert hit["document_id"] in permitted
+
+        fail = True
+        fallback = retrieval.search("shuttle", favorites_only=True, mode="keyword", limit=3)
+        assert not fallback["reranked"] and "Initial ranking is shown" in fallback["warning"]
+        assert "rank-test-secret" not in fallback["warning"]
+        coarse = ingestion.search("shuttle", favorites_only=True, limit=3)["hits"]
+        assert [hit["chunk_id"] for hit in fallback["hits"]] == [hit["chunk_id"] for hit in coarse]
+        fail = False
+        bounded = retrieval.search("shuttle", favorites_only=True, mode="keyword", limit=3)
+        assert len(bounded["hits"]) == 3
+        assert [hit.get("rerank_score") for hit in bounded["hits"]] == [0.9, 0.1, None]
+
+        def fail_if_lexical(*args, **kwargs):
+            raise AssertionError("Vector mode must not run BM25")
+
+        monkeypatch.setattr(ingestion, "search", fail_if_lexical)
+        before = len(sent)
+        single = retrieval.search("shuttle", document_ids=[documents[0]["id"]], mode="vector")
+        assert single["hits"][0]["document_id"] == documents[0]["id"]
+        assert not single["reranked"] and len(sent) == before
+        assert retrieval.search("shuttle", document_ids=[], mode="vector")["hits"] == []
+
+
+def test_rerank_revalidates_scope_and_active_version_after_network(library_components):
+    config, library, ingestion = library_components
+    config = rerank_config(replace(config, embedding_api_key=None))
+    provider = FixedEmbeddings()
+    changed = upload(library, "maintenance.txt", "Original orbital mission checklist.")
+    removed = upload(library, "cancelled.txt", "Cancelled orbital mission checklist.")
+    kept = upload(library, "safety.txt", "Safe orbital mission checklist.")
+    documents = (changed, removed, kept)
+    for document in documents:
+        library.patch(document["id"], favorite=True)
+        wait_until(lambda: ingestion.status(document["id"])["status"] == "ready", timeout=15)
+
+    def send(request):
+        candidates = json.loads(request.content)["input"]["documents"]
+        assert len(candidates) == 3
+        library.replace(
+            changed["id"], "maintenance.txt", io.BytesIO(b"Updated orbital mission checklist.")
+        )
+        library.patch(removed["id"], favorite=False)
+        return httpx.Response(
+            200,
+            json={
+                "output": {
+                    "results": [
+                        {"index": index, "relevance_score": 0.7} for index in range(len(candidates))
+                    ]
+                }
+            },
+        )
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(send)) as client,
+        running_retrieval(
+            (config, library, ingestion), provider, rerank_client=client
+        ) as retrieval,
+    ):
+        result = retrieval.search("orbital", favorites_only=True, mode="keyword")
+        assert result["reranked"]
+        [remaining] = result["hits"]
+        assert remaining["document_id"] == kept["id"]
 
 
 def test_replace_and_delete_never_return_old_chunk_or_in_flight_vectors(library_components):

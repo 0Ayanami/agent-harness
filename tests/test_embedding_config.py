@@ -15,6 +15,11 @@ def isolated_environment(monkeypatch, tmp_path):
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "DASHSCOPE_API_KEY",
+        "RERANK_ENABLED",
+        "RERANK_API_KEY",
+        "RERANK_BASE_URL",
+        "RERANK_MODEL",
+        "RERANK_CANDIDATES",
         "FALLBACK_MODEL_ID",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -34,6 +39,7 @@ def test_shared_compatible_credentials_keep_embedding_model_independent(monkeypa
     assert config.embedding_model == "text-embedding-v4"
     assert config.embedding_dimensions == 1024
     assert config.model == "chat-model-for-test"
+    assert config.rerank_base_url is None
     assert "unit-test-private-key" not in repr(config)
 
 
@@ -65,3 +71,38 @@ def test_explicit_embedding_settings_override_shared_service(monkeypatch, tmp_pa
 def test_embedding_endpoint_rejects_plaintext_or_embedded_credentials(tmp_path, url):
     with pytest.raises(ValueError, match="EMBEDDING_BASE_URL"):
         HarnessConfig(tmp_path, "test-model", embedding_base_url=url)
+
+
+def test_bailian_workspace_infers_native_rerank_endpoint_and_credentials(monkeypatch, tmp_path):
+    isolated_environment(monkeypatch, tmp_path)
+    base = "https://workspace.cn-beijing.maas.aliyuncs.com"
+    monkeypatch.setenv("OPENAI_API_KEY", "shared-test-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", base + "/compatible-mode/v1/embeddings")
+    config = HarnessConfig.from_env()
+    assert config.rerank_base_url == base + "/api/v1/services/rerank/text-rerank/text-rerank"
+    assert config.rerank_api_key == "shared-test-key"
+    assert config.rerank_model == "qwen3-rerank"
+    assert config.rerank_candidates == 20
+    assert "shared-test-key" not in repr(config)
+
+    monkeypatch.setenv("RERANK_ENABLED", "false")
+    config = HarnessConfig.from_env()
+    assert config.rerank_base_url is None and config.rerank_api_key is None
+
+
+def test_custom_rerank_endpoint_needs_its_own_key(monkeypatch, tmp_path):
+    isolated_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "embedding-only-test-key")
+    monkeypatch.setenv(
+        "OPENAI_BASE_URL", "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+    )
+    monkeypatch.setenv("RERANK_BASE_URL", "https://independent.example.test/rerank")
+    assert HarnessConfig.from_env().rerank_api_key is None
+
+    monkeypatch.setenv("RERANK_API_KEY", "independent-test-key")
+    monkeypatch.setenv("RERANK_MODEL", "alternate-rerank")
+    monkeypatch.setenv("RERANK_CANDIDATES", "12")
+    config = HarnessConfig.from_env()
+    assert config.rerank_api_key == "independent-test-key"
+    assert config.rerank_model == "alternate-rerank" and config.rerank_candidates == 12
+    assert "independent-test-key" not in repr(config)

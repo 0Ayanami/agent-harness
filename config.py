@@ -1,9 +1,44 @@
 """Explicit runtime configuration and optional live client construction."""
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+_RERANK_PATH = "/api/v1/services/rerank/text-rerank/text-rerank"
+_BAILIAN_WORKSPACE = re.compile(
+    r"[a-z0-9-]+\.(?:cn-beijing|ap-southeast-1|us-east-1)\.maas\.aliyuncs\.com"
+)
+
+
+def _validate_service_url(value, variable):
+    if not value:
+        return
+    address = urlsplit(value)
+    local = address.hostname in ("127.0.0.1", "localhost", "::1")
+    if (
+        not address.hostname
+        or (address.scheme != "https" and not (address.scheme == "http" and local))
+        or address.username
+        or address.password
+        or address.query
+        or address.fragment
+    ):
+        raise ValueError(f"{variable} must be an HTTPS URL without credentials or query parameters")
+
+
+def _bailian_rerank_endpoint(embedding_url):
+    address = urlsplit(embedding_url or "")
+    if (
+        address.scheme == "https"
+        and _BAILIAN_WORKSPACE.fullmatch(address.hostname or "")
+        and address.port in (None, 443)
+        and address.path.rstrip("/") in ("/compatible-mode/v1", "/compatible-mode/v1/embeddings")
+    ):
+        return f"https://{address.hostname}{_RERANK_PATH}"
+    return None
 
 
 @dataclass(frozen=True)
@@ -25,6 +60,10 @@ class HarnessConfig:
     embedding_base_url: str | None = None
     embedding_model: str = "text-embedding-v4"
     embedding_dimensions: int = 1024
+    rerank_api_key: str | None = field(default=None, repr=False)
+    rerank_base_url: str | None = None
+    rerank_model: str = "qwen3-rerank"
+    rerank_candidates: int = 20
 
     def __post_init__(self):
         object.__setattr__(self, "workdir", Path(self.workdir).resolve())
@@ -32,20 +71,12 @@ class HarnessConfig:
             raise ValueError("EMBEDDING_DIMENSIONS must be between 1 and 8192")
         if not self.embedding_model.strip():
             raise ValueError("EMBEDDING_MODEL must not be empty")
-        if self.embedding_base_url:
-            address = urlsplit(self.embedding_base_url)
-            local = address.hostname in ("127.0.0.1", "localhost", "::1")
-            if (
-                not address.hostname
-                or (address.scheme != "https" and not (address.scheme == "http" and local))
-                or address.username
-                or address.password
-                or address.query
-                or address.fragment
-            ):
-                raise ValueError(
-                    "EMBEDDING_BASE_URL must be an HTTPS URL without credentials or query parameters"
-                )
+        if not 2 <= self.rerank_candidates <= 50:
+            raise ValueError("RERANK_CANDIDATES must be between 2 and 50")
+        if not self.rerank_model.strip():
+            raise ValueError("RERANK_MODEL must not be empty")
+        _validate_service_url(self.embedding_base_url, "EMBEDDING_BASE_URL")
+        _validate_service_url(self.rerank_base_url, "RERANK_BASE_URL")
 
     @property
     def data_dir(self) -> Path:
@@ -59,20 +90,34 @@ class HarnessConfig:
         model = os.getenv("MODEL_ID")
         if not model:
             raise ValueError("MODEL_ID is required in the environment or .env")
+        embedding_key = (
+            os.getenv("EMBEDDING_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("DASHSCOPE_API_KEY")
+        )
+        embedding_url = os.getenv("EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
+        rerank_enabled = os.getenv("RERANK_ENABLED", "true").strip().lower()
+        if rerank_enabled not in ("true", "1", "false", "0"):
+            raise ValueError("RERANK_ENABLED must be true or false")
+        rerank_key, rerank_url = None, None
+        if rerank_enabled in ("true", "1"):
+            native_endpoint = _bailian_rerank_endpoint(embedding_url)
+            rerank_url = (os.getenv("RERANK_BASE_URL") or "").strip().rstrip("/") or native_endpoint
+            rerank_key = os.getenv("RERANK_API_KEY") or (
+                embedding_key if native_endpoint and rerank_url == native_endpoint else None
+            )
         return cls(
             Path.cwd(),
             model,
             os.getenv("FALLBACK_MODEL_ID"),
-            embedding_api_key=(
-                os.getenv("EMBEDDING_API_KEY")
-                or os.getenv("OPENAI_API_KEY")
-                or os.getenv("DASHSCOPE_API_KEY")
-            ),
-            embedding_base_url=(
-                os.getenv("EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL") or None
-            ),
+            embedding_api_key=embedding_key,
+            embedding_base_url=embedding_url,
             embedding_model=os.getenv("EMBEDDING_MODEL") or "text-embedding-v4",
             embedding_dimensions=int(os.getenv("EMBEDDING_DIMENSIONS") or "1024"),
+            rerank_api_key=rerank_key,
+            rerank_base_url=rerank_url,
+            rerank_model=os.getenv("RERANK_MODEL") or "qwen3-rerank",
+            rerank_candidates=int(os.getenv("RERANK_CANDIDATES") or "20"),
         )
 
 

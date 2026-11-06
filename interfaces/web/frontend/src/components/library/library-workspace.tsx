@@ -6,7 +6,7 @@ import { useLibrary } from "@/hooks/use-library";
 import { useLocale, useTranslations } from "@/lib/i18n";
 import { deleteLibraryFile, libraryContentUrl, libraryErrorMessage, LIBRARY_FILE_ACCEPT, patchLibraryFile, uploadLibraryFile, validateLibraryFile } from "@/lib/library-api";
 import { cn } from "@/lib/utils";
-import type { LibraryFile, LibrarySort, LibraryView } from "@/types/library";
+import type { LibraryFile, LibraryFilters, LibrarySort, LibraryView } from "@/types/library";
 import { FilePreview } from "./file-preview";
 import { LibraryDialog } from "./library-dialog";
 import { formatDate, formatSize } from "./library-format";
@@ -121,6 +121,8 @@ export function LibraryWorkspace() {
   const buttonStyle = "inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-[var(--color-border)] px-3 text-sm font-medium transition-colors hover:bg-[var(--color-bg-secondary)] disabled:opacity-40";
   const primaryStyle = "inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-zinc-900 px-4 text-sm font-medium text-white transition-colors hover:bg-zinc-700 disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white";
 
+  const semanticSearch = filters.mode === "vector" || filters.mode === "hybrid";
+
   return <div data-testid="library-page" className="relative min-w-0"
     onDragEnter={(event) => { if (event.dataTransfer.types.includes("Files")) { event.preventDefault(); dragDepth.current++; setDragging(true); } }}
     onDragOver={(event) => { if (event.dataTransfer.types.includes("Files")) event.preventDefault(); }}
@@ -158,12 +160,13 @@ export function LibraryWorkspace() {
         </div>
         <div className="mb-5 flex flex-wrap gap-2">
           <select data-testid="library-search-mode" aria-label={t("searchMode")} value={filters.mode}
-            onChange={(event) => library.updateFilters({ mode: event.target.value === "hybrid" ? "hybrid" : event.target.value === "content" ? "content" : "filename", extension: "" })}
+            onChange={(event) => library.updateFilters({ mode: event.target.value as LibraryFilters["mode"], extension: "" })}
             className="h-10 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-3 text-xs outline-none focus:ring-2 focus:ring-zinc-400/30">
-            <option value="filename">{t("filenameMode")}</option><option value="content">{t("contentMode")}</option><option value="hybrid">{rag("hybrid")}</option>
+            <option value="filename">{t("filenameMode")}</option><option value="content">{t("contentMode")}</option>
+            <option value="vector">{rag("vector")}</option><option value="hybrid">{rag("hybrid")}</option>
           </select>
           <div className="relative min-w-40 flex-1"><Search size={16} className="pointer-events-none absolute left-3 top-3 text-[var(--color-text-secondary)]" /><input data-testid="library-search" type="search" value={filters.query} maxLength={200}
-            onChange={(event) => library.updateFilters({ query: event.target.value })} placeholder={filters.mode === "hybrid" ? rag("searchHybrid") : t(filters.mode === "content" ? "contentSearch" : "search")} aria-label={filters.mode === "hybrid" ? rag("searchHybrid") : t(filters.mode === "content" ? "contentSearchLabel" : "searchLabel")}
+            onChange={(event) => library.updateFilters({ query: event.target.value })} placeholder={semanticSearch ? rag("searchSemantic") : t(filters.mode === "content" ? "contentSearch" : "search")} aria-label={semanticSearch ? rag("searchSemantic") : t(filters.mode === "content" ? "contentSearchLabel" : "searchLabel")}
             className="h-10 w-full rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] pl-9 pr-3 text-sm outline-none transition-shadow focus:ring-2 focus:ring-zinc-400/30" /></div>
           {filters.mode === "filename" && <>
             <select value={filters.extension} aria-label={t("types")} data-testid="library-type-filter" onChange={(event) => library.updateFilters({ extension: event.target.value })} className="h-10 min-w-0 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] px-3 text-xs outline-none focus:ring-2 focus:ring-zinc-400/30"><option value="">{t("allTypes")}</option><option value="md">Markdown</option><option value="txt">TXT</option><option value="pdf">PDF</option></select>
@@ -175,7 +178,7 @@ export function LibraryWorkspace() {
         {notice && <p role="status" className="mb-4 flex items-center gap-2 rounded-lg bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-200"><Check size={14} />{notice}</p>}
         {upload && <div role="status" aria-label={t("progress")} className="mb-4 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)] p-4"><div className="mb-2 flex items-center gap-2 text-xs"><Loader2 size={14} className="shrink-0 animate-spin" /><span className="shrink-0">{t("uploading")} {upload.index}/{upload.total}</span><span className="min-w-0 flex-1 truncate">{upload.name}</span><span className="tabular-nums">{upload.percent}%</span></div><progress max={100} value={upload.percent} aria-label={t("progress")} className="h-1.5 w-full accent-zinc-600 dark:accent-zinc-300" /></div>}
 
-        {filters.mode !== "filename" && <ContentResults results={library.results} loading={library.searchLoading} error={library.searchError} query={filters.query} hybrid={filters.mode === "hybrid"} onOpen={library.select} onRetry={library.refresh} />}
+        {filters.mode !== "filename" && <ContentResults results={library.results} loading={library.searchLoading} error={library.searchError} query={filters.query} mode={filters.mode} onOpen={library.select} onRetry={library.refresh} />}
         {filters.mode === "filename" && <>
         {library.loading && !listing && <div role="status" className="space-y-3 rounded-xl border border-[var(--color-border)] p-5"><p className="flex items-center gap-2 py-2 text-sm text-[var(--color-text-secondary)]"><Loader2 size={16} className="animate-spin" />{t("loading")}</p>{[1, 2, 3].map((index) => <div key={index} className="h-12 animate-pulse rounded-lg bg-[var(--color-bg-secondary)]" />)}</div>}
         {listing && listing.items.length > 0 && <div role="table" aria-label={t("all")} aria-busy={library.loading} className={cn("overflow-hidden rounded-xl border border-[var(--color-border)]", library.loading && "opacity-60")}>

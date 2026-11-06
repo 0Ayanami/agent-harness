@@ -5,10 +5,12 @@ import re
 import shutil
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from ..core.messages import json_value, repair_interrupted_turn
 from ..infrastructure.sessions import SessionRepository
 from ..services.library_rag import library_options
+from ..services.scheduler import Scheduler
 from .approvals import ApprovalBroker
 from .runtime import AgentRuntime
 
@@ -32,13 +34,15 @@ class LiveSession:
     lock: object = field(default_factory=threading.RLock)
     worker: threading.Thread | None = None
     retired: bool = False
+    cancelled_cron_generation: int = 0
 
 
 class SessionService:
-    def __init__(self, config, client_factory, *, retrieval=None):
+    def __init__(self, config, client_factory, *, retrieval=None, resume_schedules=False):
         self.config = config
         self.client_factory = client_factory
         self.retrieval = retrieval
+        self.resume_schedules = resume_schedules
         self.repository = SessionRepository(config.data_dir / "sessions.sqlite3")
         self.session_root = config.data_dir / "sessions"
         self.sessions = {}
@@ -52,6 +56,19 @@ class SessionService:
         if self.pump is None:
             for session_id in self.repository.pending_cleanup():
                 self._cleanup_deleted(session_id)
+            if self.resume_schedules:
+                for record in self.repository.list():
+                    session_id = record["id"]
+                    scheduler = self._stored_scheduler(session_id)
+                    if scheduler and scheduler.list_jobs():
+                        try:
+                            self.get(session_id)
+                        except Exception as error:
+                            logger.warning(
+                                "Could not resume schedules for %s (%s)",
+                                session_id,
+                                type(error).__name__,
+                            )
             self.pump = threading.Thread(target=self._pump_events, daemon=True)
             self.pump.start()
 
@@ -189,6 +206,76 @@ class SessionService:
             return
         self.repository.finish_cleanup(session_id)
 
+    def _stored_scheduler(self, session_id):
+        if not SESSION_ID.fullmatch(session_id):
+            return None
+        state_dir = self.session_root / session_id
+        scheduler = Scheduler(state_dir, self.shutdown)
+        try:
+            path = scheduler.DURABLE_PATH
+            if not path.is_file() or path.resolve() != path:
+                return None
+        except (OSError, RuntimeError):
+            return None
+        scheduler.load_durable_jobs()
+        return scheduler
+
+    @staticmethod
+    def _scheduled_items(scheduler, record, now, job_id=None):
+        return [
+            {**job, "session_id": record["id"], "session_title": record["title"]}
+            for job in scheduler.describe_jobs(now, job_id)
+        ]
+
+    def scheduled_tasks(self, session_id=None):
+        now = datetime.now()
+        with self.lock:
+            records = (
+                self.repository.list() if session_id is None else [self.repository.get(session_id)]
+            )
+            sources = []
+            for record in records:
+                if record["archived"]:
+                    raise SessionConflict("Restore the archived conversation first")
+                identifier = record["id"]
+                session = self.sessions.get(identifier)
+                scheduler = (
+                    session.runtime.scheduler if session else self._stored_scheduler(identifier)
+                )
+                if scheduler is not None:
+                    sources.append((scheduler, dict(session.record) if session else record))
+        items = [
+            item
+            for scheduler, record in sources
+            for item in self._scheduled_items(scheduler, record, now)
+        ]
+        return {"items": items, "server_time": now.astimezone().isoformat()}
+
+    def create_scheduled_task(self, session_id, *, cron_expr, prompt, recurring, persistent):
+        cron = " ".join(cron_expr.split())
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("Task instructions must not be empty")
+        session = self.get(session_id)
+        with session.lock:
+            if session.retired:
+                raise SessionConflict("The conversation has been archived or deleted")
+            scheduler = session.runtime.scheduler
+            with scheduler.cron_lock:
+                job = scheduler.schedule_job(cron, prompt, recurring=recurring, durable=persistent)
+                if isinstance(job, str):
+                    raise ValueError(job)
+                return self._scheduled_items(scheduler, session.record, datetime.now(), job.id)[0]
+
+    def delete_scheduled_task(self, session_id, job_id):
+        with self.lock:
+            record = self.repository.get(session_id)
+            if record["archived"]:
+                raise SessionConflict("Restore the archived conversation first")
+            session = self.sessions.get(session_id)
+            scheduler = session.runtime.scheduler if session else self._stored_scheduler(session_id)
+            return scheduler.remove_job(job_id) if scheduler else False
+
     def submit(self, session_id, message, library=None):
         options = library_options(library)
         session = self.get(session_id)
@@ -256,6 +343,7 @@ class SessionService:
             if session.retired:
                 raise SessionConflict("The conversation has been archived or deleted")
             session.runtime.cancel()
+            session.cancelled_cron_generation = session.runtime.scheduler.due_generation()
             session.approvals.cancel_all()
 
     def _pump_events(self):
@@ -269,12 +357,15 @@ class SessionService:
                             self._cleanup_deleted(session_id)
             for session in sessions:
                 with session.lock:
-                    if (
-                        not session.retired
-                        and session.status == "idle"
-                        and not session.runtime.cancelled.is_set()
-                        and session.runtime.has_events()
-                    ):
+                    if session.retired or session.status != "idle":
+                        continue
+                    if session.runtime.cancelled.is_set():
+                        if not session.runtime.scheduler.has_new_due_job(
+                            session.cancelled_cron_generation
+                        ):
+                            continue
+                        session.runtime.cancelled.clear()
+                    if session.runtime.has_events():
                         self._launch(session)
 
     def close(self):

@@ -47,6 +47,14 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
     memory_dir = tmp_path / ".memory"
     memory_dir.mkdir()
     (memory_dir / "MEMORY.md").write_text("- Browser test memory\n", encoding="utf-8")
+    skills_dir = tmp_path / "skills"
+    flat_skill = skills_dir / "browser-skill"
+    flat_skill.mkdir(parents=True)
+    (flat_skill / "SKILL.md").write_text("# Browser skill\n", encoding="utf-8")
+    nested_skill = skills_dir / "tooling" / "review-skill"
+    nested_skill.mkdir(parents=True)
+    unsafe_markup = '<img src="/external-skill-resource" onerror="alert(1)">'
+    (nested_skill / "SKILL.md").write_text(f"# Review skill\n\n{unsafe_markup}\n", encoding="utf-8")
     app = create_app(
         HarnessConfig(tmp_path, "browser-test-model"), BrowserModel, frontend_directory=output
     )
@@ -83,15 +91,24 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
                 'a[href$="/timeline"], a[href$="/compare"], a[href$="/layers"]'
             )
             browser_api.expect(teaching_links).to_have_count(0)
-            workspace = page.get_by_test_id("workspace-menu")
-            summary = workspace.locator("summary")
-            browser_api.expect(summary).to_have_text("工作区")
-            browser_api.expect(workspace).not_to_have_attribute("open", "")
+            skills = page.get_by_test_id("skill-menu")
+            summary = skills.locator("summary")
+            browser_api.expect(summary).to_have_text("技能（Skills）")
+            browser_api.expect(skills).not_to_have_attribute("open", "")
             summary.click()
+            groups = skills.get_by_test_id("skill-category")
             browser_api.expect(
-                workspace.get_by_role("link", name="Agent 工作台", exact=True)
-            ).to_have_attribute("aria-current", "page")
-            workspace.get_by_role("link", name="资料库", exact=True).click()
+                groups.filter(has_text="项目技能").get_by_role("button", name="browser-skill")
+            ).to_be_visible()
+            groups.filter(has_text="tooling").get_by_role("button", name="review-skill").click()
+            viewer = page.get_by_test_id("skill-viewer")
+            browser_api.expect(viewer.get_by_test_id("skill-markdown")).to_contain_text(
+                unsafe_markup
+            )
+            browser_api.expect(viewer.locator("img, script, a")).to_have_count(0)
+            page.keyboard.press("Escape")
+            browser_api.expect(viewer).to_have_count(0)
+            header.get_by_test_id("library-nav").click()
             browser_api.expect(page).to_have_url(f"http://127.0.0.1:{port}/zh/library/")
             brand.click()
             browser_api.expect(page.locator("#connection")).to_have_text("本地服务已连接")
@@ -115,6 +132,7 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
             )
             page.set_viewport_size({"width": 390, "height": 844})
             browser_api.expect(page.locator("#composer")).to_be_visible()
+            browser_api.expect(page.get_by_test_id("skill-menu")).to_be_visible()
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             mobile_menu = header.get_by_role("button", name="切换导航")
             mobile_menu.click()
@@ -157,6 +175,9 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
             browser_api.expect(page.locator("html")).to_have_class("dark")
             page.get_by_role("button", name="EN", exact=True).click()
             browser_api.expect(page.locator("h1")).to_have_text("Agent Workbench")
+            browser_api.expect(page.get_by_test_id("skill-menu").locator("summary")).to_have_text(
+                "Skills"
+            )
             browser_api.expect(page).to_have_title("AYANAMI")
             browser_api.expect(page.locator(".message.assistant .body")).to_contain_text(
                 "browser-ready"

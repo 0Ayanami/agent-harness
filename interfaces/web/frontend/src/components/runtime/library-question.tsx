@@ -60,8 +60,8 @@ export function LibraryQuestionControls({ value, onChange, disabled, onValidityC
         </label>
         <label className="flex min-w-0 flex-wrap items-center gap-2 text-xs"><span>{t("mode")}</span>
           <select data-testid="rag-mode" value={value.mode} disabled={disabled} aria-label={t("mode")} className={selectStyle}
-            onChange={(event) => onChange({ ...value, mode: event.target.value === "keyword" ? "keyword" : "hybrid" })}>
-            <option value="hybrid">{t("hybrid")}</option><option value="keyword">{t("keyword")}</option>
+            onChange={(event) => onChange({ ...value, mode: event.target.value as LibraryQuestion["mode"] })}>
+            <option value="hybrid">{t("hybrid")}</option><option value="keyword">{t("keyword")}</option><option value="vector">{t("vector")}</option>
           </select>
         </label>
         <button type="button" onClick={() => setAttempt((current) => current + 1)} disabled={disabled || loading} aria-label={t("refresh")} className="flex min-h-10 min-w-10 items-center justify-center rounded-lg hover:bg-[var(--color-bg-secondary)] disabled:opacity-40"><RefreshCw size={14} /></button>
@@ -85,7 +85,7 @@ export function LibraryQuestionControls({ value, onChange, disabled, onValidityC
           {(value.document_ids?.length ?? 0) >= 100 && <p className="mt-2 text-xs text-[var(--color-text-secondary)]">{t("scopeLimit")}</p>}
         </>}
       </div>}
-      {value.mode === "hybrid" && status?.configured === false && <p className="text-xs leading-5 text-amber-700 dark:text-amber-400">{t("configMissing")}</p>}
+      {value.mode !== "keyword" && status?.configured === false && <p className="text-xs leading-5 text-amber-700 dark:text-amber-400">{t(value.mode === "vector" ? "vectorConfigMissing" : "configMissing")}</p>}
     </div>}
   </div>;
 }

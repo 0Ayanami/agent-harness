@@ -42,6 +42,12 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
     app = create_app(
         HarnessConfig(tmp_path, "rag-browser-model"), lambda: model, frontend_directory=output
     )
+
+    class BrowserReranker:
+        def rerank(self, query, documents):
+            return [(index, 1 - index / len(documents)) for index in range(len(documents))]
+
+    app.state.retrieval.reranker = BrowserReranker()
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     origin = f"http://127.0.0.1:{listener.getsockname()[1]}"
@@ -83,7 +89,7 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
                 "aria-pressed", "true"
             )
 
-            # No credentials in this workdir: an attempted hybrid query must report keyword fallback.
+            # The offline reranker can reorder keyword candidates after a hybrid fallback.
             page.get_by_test_id("library-search-mode").select_option("hybrid")
             with page.expect_response(
                 lambda result: (
@@ -93,12 +99,37 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
                 page.get_by_test_id("library-search").fill("KITE_482")
             result = searched.value.json()
             assert result["mode"] == "keyword" and result["warning"]
+            assert result["reranked"] is True
             browser_api.expect(page.get_by_test_id("library-retrieval-mode")).to_contain_text(
                 "关键词"
             )
+            browser_api.expect(page.get_by_test_id("library-rerank-status")).to_have_text("已重排")
             browser_api.expect(page.get_by_test_id("library-search-results")).to_contain_text(
                 result["warning"]
             )
+            mode = page.get_by_test_id("library-search-mode")
+            with page.expect_response(
+                lambda result: (
+                    result.url.endswith("/library/search") and result.request.method == "POST"
+                )
+            ) as searched:
+                mode.select_option("vector")
+            vector_result = searched.value.json()
+            assert vector_result["mode"] == "vector" and vector_result["warning"]
+            assert vector_result["hits"] == [] and vector_result["reranked"] is False
+            page.reload()
+            browser_api.expect(mode).to_have_value("vector")
+            browser_api.expect(page.get_by_test_id("library-retrieval-mode")).to_have_text(
+                "向量检索"
+            )
+            browser_api.expect(page.get_by_test_id("library-rerank-status")).to_have_text(
+                "未使用重排"
+            )
+            browser_api.expect(page.get_by_test_id("library-search-results")).to_contain_text(
+                vector_result["warning"]
+            )
+            browser_api.expect(page.get_by_test_id("library-search-hit")).to_have_count(0)
+            mode.select_option("hybrid")
             page.get_by_test_id("library-search-hit").filter(has_text="恢复手册.txt").click()
             preview = page.get_by_test_id("library-preview")
             browser_api.expect(preview.get_by_test_id("library-vector-status")).to_have_attribute(
@@ -172,12 +203,18 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
                 "关键词"
             )
 
-            page.get_by_test_id("message-input").fill("UNMATCHABLE_3749300_X")
+            page.get_by_test_id("rag-mode").select_option("vector")
+            page.get_by_test_id("message-input").fill("KITE_482 仅向量检索")
             page.get_by_test_id("send-message").click()
             browser_api.expect(assistants).to_have_count(3)
+            retrieval = page.get_by_test_id("rag-retrieval-status")
+            browser_api.expect(retrieval).to_contain_text("向量检索")
+            browser_api.expect(retrieval).to_contain_text(vector_result["warning"])
+            browser_api.expect(page.get_by_test_id("rag-rerank-status")).to_have_text("未使用重排")
             browser_api.expect(
                 page.get_by_text("本条回答没有可验证的来源引用。", exact=True)
             ).to_be_visible()
+            assert posts[2]["library"]["mode"] == "vector"
             assert len(model.calls) == 3
             page.set_viewport_size({"width": 390, "height": 844})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

@@ -102,6 +102,27 @@ def test_pdf_and_utf16_text_are_extracted_and_not_just_filename_matches(indexed_
     assert browser.get(FILES, params={"q": "QUASAR"}).json()["items"] == []
 
 
+def test_vector_only_reports_unavailable_instead_of_returning_keyword_hits(indexed_library):
+    browser, _, _ = indexed_library
+    document = upload(browser, "protocol.txt", b"QUASAR protocol restores checkpoints.")
+    wait_index(browser, document["id"])
+    assert search(browser, "QUASAR")
+
+    def query(mode):
+        response = browser.post(
+            "/api/agent/library/search", headers=HEADERS, json={"query": "QUASAR", "mode": mode}
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    vector = query("vector")
+    assert vector["mode"] == "vector" and vector["hits"] == []
+    assert vector["warning"] and vector["reranked"] is False
+    hybrid = query("hybrid")
+    assert hybrid["mode"] == "keyword" and hybrid["hits"]
+    assert hybrid["warning"] and hybrid["reranked"] is False
+
+
 def test_long_document_has_searchable_tail_and_multiple_chunks(indexed_library):
     browser, _, _ = indexed_library
     paragraphs = [

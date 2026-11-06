@@ -58,8 +58,8 @@ def library_options(options):
     if not isinstance(favorites, bool):
         raise ValueError("Library favorites_only must be a boolean")
     mode = options.get("mode", "hybrid")
-    if mode not in ("hybrid", "keyword"):
-        raise ValueError("Library mode must be hybrid or keyword")
+    if mode not in ("hybrid", "keyword", "vector"):
+        raise ValueError("Library mode must be hybrid, keyword, or vector")
     return {
         "enabled": True,
         "document_ids": list(dict.fromkeys(documents)) if documents is not None else None,
@@ -86,6 +86,7 @@ class LibraryRAG:
         self.identifiers = {}
         self.warnings = []
         self.mode = "keyword"
+        self.reranked = False
 
     def register(self, registry):
         registry.register(LIBRARY_TOOLS[0], self.search_tool)
@@ -103,6 +104,7 @@ class LibraryRAG:
         self.identifiers = {}
         self.warnings = []
         self.mode = self.options["mode"]
+        self.reranked = False
         if len(query) > 2000:
             self._warn("问题较长，本轮初次检索使用前 2000 个字符；可通过补充搜索缩小范围。")
         self._search(query[:2000], self.options["document_ids"], 8)
@@ -192,6 +194,7 @@ class LibraryRAG:
                 "run_id": self.run_id,
                 "query": query,
                 "mode": self.mode,
+                "reranked": self.reranked,
                 "warning": "\n".join(self.warnings) or None,
                 "sources": list(self.sources.values()),
             },
@@ -212,12 +215,13 @@ class LibraryRAG:
         except Exception:
             # Never persist arbitrary provider exception bodies or credentials.
             result = {
-                "mode": "keyword",
+                "mode": self.options["mode"],
                 "hits": [],
                 "warning": "资料检索暂不可用，请检查检索服务后重试。",
             }
         self._check_cancelled()
         self.mode = result.get("mode", "keyword")
+        self.reranked = bool(result.get("reranked"))
         self._warn(result.get("warning"))
         found = []
         for hit in result.get("hits", []):
@@ -249,7 +253,12 @@ class LibraryRAG:
             narrowed = [item for item in document_ids if item in scope]
         found = self._search(query.strip(), narrowed, limit)
         return json.dumps(
-            {"mode": self.mode, "sources": found, "warning": "\n".join(self.warnings) or None},
+            {
+                "mode": self.mode,
+                "reranked": self.reranked,
+                "sources": found,
+                "warning": "\n".join(self.warnings) or None,
+            },
             ensure_ascii=False,
         )
 

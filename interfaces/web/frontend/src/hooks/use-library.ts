@@ -10,12 +10,13 @@ type Selection = { id: string | null; chunkId: string | null };
 function readLocation() {
   const params = new URLSearchParams(window.location.search);
   const view = params.get("view");
+  const mode = params.get("mode");
   const sort = params.get("sort");
   const extension = params.get("type") || "";
   const offset = Number(params.get("offset") || "0");
   const filters: LibraryFilters = {
     query: (params.get("q") || "").slice(0, 200),
-    mode: params.get("mode") === "hybrid" ? "hybrid" : params.get("mode") === "content" ? "content" : "filename",
+    mode: mode === "content" || mode === "vector" || mode === "hybrid" ? mode : "filename",
     view: view === "favorites" || view === "recent" ? view : "all",
     extension: ["md", "txt", "pdf"].includes(extension) ? extension : "",
     sort: sort === "name_asc" || sort === "size_desc" ? sort : "updated_desc",
@@ -112,7 +113,7 @@ export function useLibrary() {
     setSearchError(null);
     setResults(null);
     const timer = window.setTimeout(() => {
-      searchLibraryContent(filters.query.trim(), filters.view === "favorites", controller.signal, filters.mode === "hybrid" ? "hybrid" : "keyword")
+      searchLibraryContent(filters.query.trim(), filters.view === "favorites", controller.signal, filters.mode === "vector" || filters.mode === "hybrid" ? filters.mode : "keyword")
         .then((response) => { if (!controller.signal.aborted) setResults(response); })
         .catch((reason: unknown) => { if (!controller.signal.aborted) setSearchError(reason); })
         .finally(() => { if (!controller.signal.aborted) setSearchLoading(false); });

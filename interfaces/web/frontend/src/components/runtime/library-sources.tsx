@@ -2,6 +2,7 @@
 
 import { ArrowUpRight, BookOpen, Search } from "lucide-react";
 import { useLocale, useTranslations } from "@/lib/i18n";
+import { retrievalMethodKey } from "@/i18n/rag-messages";
 import { locationLabel } from "@/components/library/content-results";
 import type { LibraryRetrieval, RuntimeMessage } from "@/types/runtime";
 
@@ -30,7 +31,10 @@ export function LibraryRetrievalStatus({ retrieval, pending }: { retrieval?: Lib
   const t = useTranslations("rag");
   if (!retrieval && !pending) return null;
   return <div data-testid="rag-retrieval-status" role="status" className="mb-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg-secondary)]/60 p-3 text-xs leading-6">
-    <p className="flex items-center gap-2"><Search size={14} className="shrink-0" />{retrieval ? t(retrieval.mode === "hybrid" ? "hybridUsed" : "keywordUsed") : t("checking")}</p>
+    <div className="flex flex-wrap items-center gap-x-3 text-[var(--color-text-secondary)]">
+      <p className="flex items-center gap-2 text-[var(--color-text)]"><Search size={14} className="shrink-0" />{retrieval ? t(retrievalMethodKey(retrieval.mode)) : t("checking")}</p>
+      {typeof retrieval?.reranked === "boolean" && <p data-testid="rag-rerank-status">{t(retrieval.reranked ? "reranked" : "notReranked")}</p>}
+    </div>
     {retrieval && <p className="text-[var(--color-text-secondary)]">{retrieval.sources.length ? `${t("retrieved")} ${retrieval.sources.length} ${t("passages")}` : t("empty")}</p>}
     {retrieval?.warning && <p className="break-words text-amber-700 dark:text-amber-400">{retrieval.warning}</p>}
   </div>;

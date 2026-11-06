@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ArrowUp, Square, Bot, AlertCircle, X } from "lucide-react";
+import { ArrowUp, Square, Bot, AlertCircle, CalendarClock, X } from "lucide-react";
 import { Sidebar } from "@/components/layout/sidebar";
 import { SimulatorMessage } from "@/components/simulator/simulator-message";
 import { Card } from "@/components/ui/card";
@@ -14,11 +14,14 @@ import { useAgentSession } from "@/hooks/use-agent-session";
 import type { LibraryQuestion } from "@/types/runtime";
 import { LibraryQuestionControls } from "./library-question";
 import { LibraryRetrievalStatus, LibrarySources } from "./library-sources";
+import { ScheduledTasks } from "./scheduled-tasks";
 
 export function AgentWorkbench() {
   const t = useTranslations("runtime");
+  const schedule = useTranslations("schedule");
   const agent = useAgentSession();
   const [draft, setDraft] = useState("");
+  const [schedulePanel, setSchedulePanel] = useState<{ prompt?: string } | null>(null);
   const [library, setLibrary] = useState<LibraryQuestion>({ enabled: false, document_ids: null, favorites_only: false, mode: "hybrid" });
   const [libraryValid, setLibraryValid] = useState(true);
   const bottom = useRef<HTMLDivElement>(null);
@@ -52,6 +55,7 @@ export function AgentWorkbench() {
         loading={loading || agent.sessionActionPending} busy={!!view?.busy}
         onSelect={(id) => { agent.openSession(id).catch(agent.reportError); }}
         onCreate={() => { agent.createSession().catch(agent.reportError); }}
+        onOpenScheduledTasks={() => setSchedulePanel({})}
         onArchiveChange={(id, archived) => agent.changeSession(id, { archived })}
         onDelete={agent.changeSession} />
       <div className="min-w-0 flex-1">
@@ -119,6 +123,11 @@ export function AgentWorkbench() {
                   onChange={(event) => { if (view) void agent.changeSession(view.snapshot.id, { temporary: event.target.checked }); }} />
                 {t("temporaryConversation")}
               </label>
+              <button type="button" data-testid="scheduled-tasks-compose" aria-haspopup="dialog" disabled={optionsDisabled}
+                onClick={() => setSchedulePanel({ prompt: draft })}
+                className="inline-flex min-h-8 items-center gap-2 rounded-md px-1 text-sm font-medium hover:bg-[var(--color-bg-secondary)] disabled:opacity-50">
+                <CalendarClock size={15} strokeWidth={1.6} />{schedule("title")}
+              </button>
               <p id="conversation-memory-hint" className="basis-full text-xs leading-5 text-[var(--color-text-secondary)]">{t(memoryHint)}</p>
             </LibraryQuestionControls>
             <div className="flex items-end gap-2 rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] p-2 focus-within:ring-2 focus-within:ring-blue-500/30">
@@ -142,6 +151,11 @@ export function AgentWorkbench() {
         </Card>
         {view && <div className="mt-5"><ProjectState state={view.snapshot.state} onRefresh={agent.refresh} /></div>}
       </div>
+      {schedulePanel && <ScheduledTasks session={view?.snapshot ?? null} initialPrompt={schedulePanel.prompt}
+        onClose={() => setSchedulePanel(null)} onOpenSession={(id) => {
+          setSchedulePanel(null);
+          if (id !== agent.selectedId) agent.openSession(id).catch(agent.reportError);
+        }} />}
     </div>
   );
 }
