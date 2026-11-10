@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request,
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ...application.sessions import SessionConflict, SessionService
@@ -239,30 +240,44 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
         once: bool = False,
         last_event_id: int = Header(default=0, alias="Last-Event-ID"),
     ):
-        if not application.repository.exists(session_id):
+        cursor = max(after, last_event_id)
+        page = await run_in_threadpool(
+            application.repository.event_page, session_id, cursor, snapshot=once
+        )
+        if not page["exists"]:
             raise HTTPException(404, "Session not found")
 
         async def stream():
-            cursor = max(after, last_event_id)
-            upper_bound = application.repository.cursor(session_id) if once else None
+            current_page, current_cursor = page, cursor
+            upper_bound = page["through"]
             deadline = time.monotonic() + 15
             while not application.shutdown.is_set():
-                batch = application.repository.events(session_id, cursor, through=upper_bound)
+                batch = current_page["events"]
                 for event in batch:
-                    cursor = event["id"]
-                    yield f"id: {cursor}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    current_cursor = event["id"]
+                    yield f"id: {current_cursor}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
                 if once:
-                    if not batch or cursor >= upper_bound:
+                    if not batch or current_cursor >= upper_bound:
                         return
+                    current_page = await run_in_threadpool(
+                        application.repository.event_page,
+                        session_id, current_cursor, through=upper_bound,
+                    )
                     continue
                 if (
                     time.monotonic() > deadline
                     or await request.is_disconnected()
-                    or (not batch and not application.repository.exists(session_id))
+                    or not current_page["exists"]
                 ):
                     return
                 yield ": keepalive\n\n"
                 await asyncio.sleep(0.3)
+                # SQLite may wait on a writer or filesystem I/O. One worker call
+                # reads the whole page without blocking unrelated ASGI requests.
+                current_page = await run_in_threadpool(
+                    application.repository.event_page,
+                    session_id, current_cursor, through=upper_bound,
+                )
 
         return StreamingResponse(
             stream(),

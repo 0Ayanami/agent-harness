@@ -479,3 +479,124 @@ def test_replace_and_delete_never_return_old_chunk_or_in_flight_vectors(library_
         wait_until(vectors_removed, timeout=15)
         assert retrieval.search("orbital")["hits"] == []
         assert retrieval.status()["ready_documents"] == 0
+
+
+def test_bulk_current_reads_keep_ranking_and_scope_without_per_candidate_connections(
+    library_components, monkeypatch
+):
+    config, library, ingestion = library_components
+    primary = upload(
+        library,
+        "bulk.md",
+        "\n".join(f"# Passage {index}\nOrbital bulk passage {index}." for index in range(420)),
+    )
+    other = upload(library, "other.txt", "Orbital passage outside the selected scope.")
+    removed = upload(library, "removed.txt", "Orbital passage that will be deleted.")
+    changed = upload(library, "changed.txt", "Orbital passage that will be replaced.")
+    for document in (primary, other, removed, changed):
+        wait_until(lambda: ingestion.status(document["id"])["status"] == "ready", timeout=15)
+    ingestion.close()
+    stale = ingestion.search("orbital", limit=1000)["hits"]
+    assert len(stale) == 423
+    library.patch(primary["id"], name="current-name.md", favorite=True)
+    library.patch(removed["id"], favorite=True)
+    library.patch(changed["id"], favorite=True)
+    library.delete(removed["id"])
+    library.replace(changed["id"], "changed.txt", io.BytesIO(b"New active procedure."))
+    retrieval = RetrievalService(replace(config, embedding_api_key=None), library, ingestion)
+    ranked = [
+        {**hit, "score": 1000.0 - index, "rerank_score": 1.0 / (index + 1)}
+        for index, hit in enumerate(reversed(stale))
+    ]
+    primary_hit = next(hit for hit in ranked if hit["document_id"] == primary["id"])
+    # The same chunk may occur twice; preserve each rank rather than collapse input.
+    ranked.append({**primary_hit, "score": 7.0, "rerank_score": 0.5})
+    forged = [
+        {**primary_hit, "document_id": other["id"]},
+        {**primary_hit, "version_id": "retired-version"},
+    ]
+    original_connection = library.repository.connection
+    connections = 0
+
+    @contextmanager
+    def counted_connection():
+        nonlocal connections
+        connections += 1
+        with original_connection() as database:
+            yield database
+
+    monkeypatch.setattr(library.repository, "connection", counted_connection)
+    try:
+        for scope in ([primary["id"]], None):
+            before = connections
+            current = retrieval._current_hits(ranked + forged, scope, True)
+            expected = [hit for hit in ranked if hit["document_id"] == primary["id"]]
+            assert len(current) == 421
+            assert [hit["chunk_id"] for hit in current] == [hit["chunk_id"] for hit in expected]
+            assert [(hit["score"], hit["rerank_score"]) for hit in current] == [
+                (hit["score"], hit["rerank_score"]) for hit in expected
+            ]
+            assert {hit["name"] for hit in current} == {"current-name.md"}
+            assert connections - before == 1, "Hundreds of candidates share one short transaction"
+        before = connections
+        assert retrieval._current_hits(ranked, [], False) == []
+        assert retrieval._current_hits([], None, False) == []
+        assert connections == before
+    finally:
+        retrieval.close()
+
+
+def test_bulk_vector_hydration_rejects_invalid_identity_and_nonfinite_scores(
+    library_components, monkeypatch
+):
+    _, library, ingestion = library_components
+    provider = FixedEmbeddings()
+    first = upload(library, "first.txt", "Orbital source that is allowed.")
+    second = upload(library, "second.txt", "Orbital source outside the scope.")
+    library.patch(first["id"], favorite=True)
+    with running_retrieval(library_components, provider) as retrieval:
+        for document in (first, second):
+            wait_vector(library, document["id"])
+        jobs, _ = retrieval._ready_context(None, False)
+        by_document = {job["document_id"]: job for job in jobs.values()}
+        passages = {
+            hit["document_id"]: hit for hit in ingestion.search("orbital")["hits"]
+        }
+        first_job, second_job = by_document[first["id"]], by_document[second["id"]]
+        payload = {
+            "job_id": first_job["id"],
+            "document_id": first["id"],
+            "version_id": first["version_id"],
+            "chunk_id": passages[first["id"]]["chunk_id"],
+        }
+        # Stop workers before measuring database work; the real durable index remains.
+        retrieval.close()
+        ingestion.close()
+        points = [
+            {"payload": payload, "score": 0.9},
+            *({"payload": payload, "score": score} for score in (float("nan"), float("inf"), True, "0.8")),
+            {"payload": {**payload, "job_id": "retired-job"}, "score": 0.8},
+            {"payload": {**payload, "document_id": second["id"]}, "score": 0.8},
+            {"payload": {**payload, "version_id": "retired-version"}, "score": 0.8},
+            {"payload": {**payload, "chunk_id": passages[second["id"]]["chunk_id"]}, "score": 0.8},
+            {"payload": {**payload, "chunk_id": ["invalid-type"]}, "score": 0.8},
+            {"payload": {**payload, "chunk_id": "missing-chunk"}, "score": 0.8},
+            {"payload": {
+                "job_id": second_job["id"], "document_id": second["id"],
+                "version_id": second["version_id"], "chunk_id": passages[second["id"]]["chunk_id"],
+            }, "score": 0.7},
+        ]
+        original_connection = library.repository.connection
+        connections = 0
+
+        @contextmanager
+        def counted_connection():
+            nonlocal connections
+            connections += 1
+            with original_connection() as database:
+                yield database
+
+        monkeypatch.setattr(library.repository, "connection", counted_connection)
+        hits = retrieval._hydrate(points, [first["id"]], True)
+        assert hits == [{**passages[first["id"]], "score": 0.9}]
+        assert connections == 2, "One readiness read and one scoped passage batch"

@@ -514,31 +514,19 @@ class RetrievalService:
         return self.ingestion.read_chunk(document_id, chunk_id)
 
     def _current_hits(self, hits, document_ids, favorites_only):
-        if document_ids is not None and not document_ids:
-            return []
-        conditions, values = ["deleted_at IS NULL"], []
-        if document_ids is not None:
-            conditions.append(f"id IN ({','.join('?' for _ in document_ids)})")
-            values.extend(document_ids)
-        if favorites_only:
-            conditions.append("favorite=1")
-        with self.repository.connection() as database:
-            allowed = {
-                row[0]
-                for row in database.execute(
-                    "SELECT id FROM library_files WHERE " + " AND ".join(conditions),
-                    values,
-                )
-            }
+        current_chunks = self.ingestion.read_chunks(
+            [hit["chunk_id"] for hit in hits],
+            document_ids=document_ids,
+            favorites_only=favorites_only,
+        )
         result = []
         for hit in hits:
-            if hit["document_id"] not in allowed:
-                continue
-            try:
-                current = self.read_chunk(hit["document_id"], hit["chunk_id"])
-            except LibraryError:
-                continue
-            if current["version_id"] == hit["version_id"]:
+            current = current_chunks.get(hit["chunk_id"])
+            if (
+                current is not None
+                and current["document_id"] == hit["document_id"]
+                and current["version_id"] == hit["version_id"]
+            ):
                 ranking = {key: hit[key] for key in ("score", "rerank_score") if key in hit}
                 result.append({**current, **ranking})
         return result
@@ -555,25 +543,35 @@ class RetrievalService:
 
     def _hydrate(self, points, document_ids, favorites_only):
         jobs, _ = self._ready_context(document_ids, favorites_only)
-        hits = []
+        candidates = []
         for point in points:
             payload = point.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
             job = jobs.get(payload.get("job_id"))
+            score = point.get("score")
             if (
                 not job
                 or job["document_id"] != payload.get("document_id")
                 or job["version_id"] != payload.get("version_id")
-            ):
-                continue
-            try:
-                hit = self.read_chunk(job["document_id"], payload["chunk_id"])
-            except (LibraryError, KeyError):
-                continue
-            score = point.get("score")
-            if (
-                hit["version_id"] != job["version_id"]
+                or not isinstance(payload.get("chunk_id"), str)
                 or type(score) not in (int, float)
                 or not math.isfinite(score)
+            ):
+                continue
+            candidates.append((payload, job, score))
+        current_chunks = self.ingestion.read_chunks(
+            [payload["chunk_id"] for payload, _, _ in candidates],
+            document_ids=document_ids,
+            favorites_only=favorites_only,
+        )
+        hits = []
+        for payload, job, score in candidates:
+            hit = current_chunks.get(payload["chunk_id"])
+            if (
+                hit is None
+                or hit["document_id"] != job["document_id"]
+                or hit["version_id"] != job["version_id"]
             ):
                 continue
             hits.append({**hit, "score": float(score)})

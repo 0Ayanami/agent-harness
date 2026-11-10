@@ -288,6 +288,32 @@ class LibraryIndexRepository:
             raise KeyError(chunk_id)
         return self._hit(row)
 
+    def read_chunks(self, chunk_ids, *, document_ids=None, favorites_only=False):
+        """Hydrate candidates in bounded batches while enforcing current scope in SQL."""
+        identifiers = list(dict.fromkeys(value for value in chunk_ids if isinstance(value, str)))
+        if not identifiers or document_ids == []:
+            return {}
+        conditions = ["f.deleted_at IS NULL", "c.version_id=f.version_id"]
+        values = []
+        if document_ids is not None:
+            conditions.append(f"f.id IN ({','.join('?' for _ in document_ids)})")
+            values.extend(document_ids)
+        if favorites_only:
+            conditions.append("f.favorite=1")
+        result = {}
+        # Keep below SQLite's historical parameter limit even with a 100-file scope.
+        with self.repository.connection() as database:
+            for first in range(0, len(identifiers), 400):
+                batch = identifiers[first : first + 400]
+                rows = database.execute(
+                    "SELECT c.*,f.name FROM library_chunks c JOIN library_files f "
+                    "ON f.id=c.document_id WHERE " + " AND ".join(conditions)
+                    + f" AND c.id IN ({','.join('?' for _ in batch)})",
+                    [*values, *batch],
+                ).fetchall()
+                result.update((row["id"], self._hit(row)) for row in rows)
+        return result
+
     def search(self, query, *, document_ids=None, favorites_only=False, limit=10):
         if document_ids is not None and not document_ids:
             return []

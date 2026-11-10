@@ -159,6 +159,33 @@ class SessionRepository:
             ).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload"])} for row in rows]
 
+    def event_page(self, session_id, after=0, *, through=None, snapshot=False):
+        """Read existence, replay boundary and one page using one SQLite snapshot.
+
+        SSE must not open separate connections or schedule separate worker calls
+        for each of these small reads. A fixed replay boundary excludes later
+        writes while still allowing the caller to paginate more than 200 rows.
+        """
+        with self.connection() as database:
+            database.execute("BEGIN")
+            exists = database.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone() is not None
+            if snapshot:
+                through = database.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = ?", (session_id,)
+                ).fetchone()[0]
+            rows = database.execute(
+                "SELECT * FROM events WHERE session_id = ? AND id > ? "
+                "AND (? IS NULL OR id <= ?) ORDER BY id LIMIT 200",
+                (session_id, after, through, through),
+            ).fetchall() if exists else []
+        return {
+            "exists": exists,
+            "through": through,
+            "events": [{**dict(row), "payload": json.loads(row["payload"])} for row in rows],
+        }
+
     def cursor(self, session_id):
         with self.connection() as database:
             return database.execute(

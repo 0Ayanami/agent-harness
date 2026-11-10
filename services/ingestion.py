@@ -77,6 +77,11 @@ class IngestionService:
                 404, "Chunk is missing or no longer belongs to the current document"
             ) from None
 
+    def read_chunks(self, chunk_ids, *, document_ids=None, favorites_only=False):
+        return self.index.read_chunks(
+            chunk_ids, document_ids=document_ids, favorites_only=favorites_only
+        )
+
     def _process(self, job):
         key = None
         try:

@@ -75,7 +75,7 @@ python -m agent_harness
 
 百炼 Embedding 复用后端 `.env` 的 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`，默认 `text-embedding-v4`、1024 维。兼容地址属于受支持的百炼业务空间时，后端自动推导同空间的原生 DashScope 重排地址并复用密钥。可用 `RERANK_ENABLED=false` 关闭，或通过 `RERANK_API_KEY`、`RERANK_BASE_URL`、`RERANK_MODEL` 和 `RERANK_CANDIDATES` 独立配置。地址格式见 [.env.example](.env.example) 和 [百炼文本排序接口](https://help.aliyun.com/zh/model-studio/text-rerank-api)。
 
-向量化会发送文本块或查询，重排会发送本次问题与候选段落，聊天服务只接收本轮回答所需证据。原件、SQLite 和本地 Qdrant 保存在当前工作目录的 `.runtime/agent-harness/library/`。资料库问答按轮次隔离证据，追问时请在本轮写明所指内容。 [资料库阶段总结](docs/library-stage-summary.zh-CN.md) · [CRUD 与 RAG 面试手册](docs/crud-rag-interview-guide.md)
+向量化会发送文本块或查询，重排会发送本次问题与候选段落，聊天服务只接收本轮回答所需证据。原件、SQLite 和本地 Qdrant 保存在当前工作目录的 `.runtime/agent-harness/library/`。资料库问答按轮次隔离证据，追问时请在本轮写明所指内容。 [资料库阶段总结](docs/library-stage-summary.zh-CN.md) · [CRUD 与 RAG 面试手册](docs/interview/crud-rag-interview-guide.md)
 
 顶栏可进入 Agent 工作台和资料库。左侧的 **Skills** 列出当前工作目录 `skills/` 中的技能，子目录用于分组。点击技能可在站内抽屉查看 `SKILL.md` 原文。会话创建与切换单独放在侧栏。迁移来源见 `interfaces/web/frontend/MIGRATION.md`。
 
@@ -242,6 +242,8 @@ python -m ruff format --check application core infrastructure interfaces service
 ```
 
 普通测试使用模型替身，验证实际工具、存储、任务、团队协议、后台执行、HTTP、SSE、审批、并发拒绝、取消与恢复。浏览器测试启动真实本地服务器，用无界面 Edge 完成对话、权限确认、刷新恢复和移动端布局检查；其他平台可设置 `HARNESS_BROWSER_EXECUTABLE` 指向已安装的 Chromium 浏览器，没有可用浏览器时跳过该项。测试不会调用在线模型 API。
+
+面试用的功能覆盖、优化前后性能数据、生产问题分析、私有部署与多租户方案集中在 [面试复习索引](docs/interview/README.md)。性能工具使用独立合成数据与模拟提供商，结果描述本地实现开销，不代表线上模型容量。
 
 ## 过程文件管理
 
