@@ -2,7 +2,7 @@
 
 这是从教学工程中独立出来的 agent 应用。本仓库根目录就是应用目录，Python 包名为 `agent_harness`；原教学工程的 `s01_*` 到 `s17_*`、`agents/` 和 `web/` 不在当前仓库中。
 
-本版把已有能力组织为组合式运行时，网页从原有 `web/` 的 Next.js 工程迁移，沿用原站的布局、主题、多语言和消息组件，并接入实际 Agent。主循环、子 Agent、记忆、任务、团队、上下文压缩、后台任务、cron 和模拟 MCP 沿用现有项目的算法。资料库提供文件管理、自动入库、关键词与向量召回、混合检索、模型重排，以及可定位到原文的 Agent 问答。
+本版把已有能力组织为组合式运行时，网页从原有 `web/` 的 Next.js 工程迁移，沿用原站的布局、主题、多语言和消息组件，并接入实际 Agent。主循环、子 Agent、记忆、任务、团队、上下文压缩、后台任务和 cron 沿用现有项目的算法。资料库提供文件管理、自动入库、关键词与向量召回、混合检索、模型重排，以及可定位到原文的 Agent 问答。普通对话支持 Docker MCP 工具，可查询 arXiv 和 Wikipedia。
 
 ## 启动网页
 
@@ -11,13 +11,13 @@
 ```powershell
 Set-Location D:\research\agent-harness
 . .\.venv\Scripts\Activate.ps1
-uv sync --frozen
+uv sync --frozen --extra milvus --extra redis
 .\scripts\project.ps1 deps
 .\scripts\project.ps1 build
 .\scripts\project.ps1 run
 ```
 
-打开 **http://127.0.0.1:8000/zh/**。首次安装和修改前端后需要用 Node.js 构建；沿用原站的静态导出模式，构建后由 Python 同源提供页面、资源、API 和 SSE。日常执行 `.\scripts\project.ps1 run` 即可，无需手动激活虚拟环境。手动激活后使用 `python -m agent_harness` 或 `agent-harness` 也仍然支持。
+打开 **http://127.0.0.1:8000/zh/**。首次安装和修改前端后需要用 Node.js 构建；沿用原站的静态导出模式，构建后由 Python 同源提供页面、资源、API 和 SSE。配置了 `VECTOR_BACKEND=milvus` 时，先按 [Milvus 部署说明](deployment/milvus/README.md) 启动容器；配置了 `REDIS_URL` 时可复用本机 Redis。日常执行 `.\scripts\project.ps1 run` 即可，无需手动激活虚拟环境。手动激活后使用 `python -m agent_harness` 或 `agent-harness` 也仍然支持。
 
 启动前配置仓库根目录 `.env` 的 `MODEL_ID`、`ANTHROPIC_API_KEY`，以及可选的 `ANTHROPIC_BASE_URL`、`FALLBACK_MODEL_ID`。没有 `.env` 时才执行 `Copy-Item .env.example .env`，再填写真实配置。模型接口使用 Anthropic Messages 协议，第三方服务需要支持该协议，不能直接填入仅支持 OpenAI 协议的地址。密钥保留在 Python 后端，不发送给浏览器。改变端口或工作区：
 
@@ -67,15 +67,29 @@ python -m agent_harness
 
 | 召回方式 | 处理流程 |
 | --- | --- |
-| 关键词 | SQLite FTS5 按 BM25 排名，短查询还可按字面补查。 |
-| 向量检索 | 对问题向量化，以余弦相似度查询本地 Qdrant。语义服务不可用时返回提示和空结果。 |
+| 关键词 | Python应用层BM25倒排索引，短查询还可按字面补查；SQLite保存预分词内容与缓存失效修订号。 |
+| 向量检索 | 对问题向量化，以余弦相似度查询Milvus；显式选择qdrant时保留旧本地后端。语义服务不可用时返回提示和空结果。 |
 | 混合检索 | 关键词与向量双路召回，用 RRF 合并排名。语义服务不可用时降级为关键词并显示提示。 |
 
 配置 Rerank 后，三种方式都可将已按范围筛过的候选交给 `qwen3-rerank`。重排发生在最终 Top K 之前，默认最多发送 20 个候选。请求失败时保留召回顺序并提示。检索接口分别返回重排分数和召回分数。
 
 百炼 Embedding 复用后端 `.env` 的 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`，默认 `text-embedding-v4`、1024 维。兼容地址属于受支持的百炼业务空间时，后端自动推导同空间的原生 DashScope 重排地址并复用密钥。可用 `RERANK_ENABLED=false` 关闭，或通过 `RERANK_API_KEY`、`RERANK_BASE_URL`、`RERANK_MODEL` 和 `RERANK_CANDIDATES` 独立配置。地址格式见 [.env.example](.env.example) 和 [百炼文本排序接口](https://help.aliyun.com/zh/model-studio/text-rerank-api)。
 
-向量化会发送文本块或查询，重排会发送本次问题与候选段落，聊天服务只接收本轮回答所需证据。原件、SQLite 和本地 Qdrant 保存在当前工作目录的 `.runtime/agent-harness/library/`。资料库问答按轮次隔离证据，追问时请在本轮写明所指内容。 [资料库阶段总结](docs/library-stage-summary.zh-CN.md) · [CRUD 与 RAG 面试手册](docs/interview/crud-rag-interview-guide.md)
+向量化会发送文本块或查询，重排会发送本次问题与候选段落，聊天服务只接收本轮回答所需证据。原件、SQLite及旧Qdrant目录位于 `.runtime/agent-harness/library/`，Docker Milvus数据位于 `.runtime/agent-harness/milvus/`。资料库问答按轮次隔离证据，追问时请在本轮写明所指内容。 [资料库阶段总结](docs/library-stage-summary.zh-CN.md) · [CRUD 与 RAG 面试手册](interview/crud-rag-interview-guide.md)
+
+文档按 **Document → Section → Chunk → Vector** 持久化管理。Markdown保留标题树，TXT使用文档根节点，PDF按页建立Section，Chunk关联Section，Vector映射记录chunk、模型、维度与后端。`GET /api/agent/library/files/{id}/structure` 返回当前版本的树和向量映射。OCR、图片和表格专门识别尚待接入，当前保留内容类型、位置和提取元数据。
+
+首次使用Milvus，在Docker Desktop运行后逐行执行：
+
+```powershell
+uv sync --frozen --extra test --extra browser --extra milvus --extra redis
+docker compose -f deployment/milvus/compose.yaml up -d --wait
+.\scripts\project.ps1 run
+```
+
+后端 `.env` 设置 `VECTOR_BACKEND=milvus`、`MILVUS_URI=http://127.0.0.1:19530`。代码默认保留qdrant以兼容旧工作区，切换必须显式配置；Milvus不可用时不会悄悄连接旧向量库。旧原件和embedding缓存保留，新后端在独立索引profile下重建。完整部署、停机与持久化说明见 [Milvus部署](deployment/milvus/README.md)，分层设计和 OCR 演进见 [技术手册](interview/crud-rag-interview-guide.md#milvus-hierarchy)。
+
+可选Redis配置为 `REDIS_URL=redis://127.0.0.1:6379/0`、`REDIS_PREFIX=ayanami`、`REDIS_CACHE_TTL=300`。会话和事件仍持久化在 `.runtime/agent-harness/sessions.sqlite3`，长期记忆位于工作区根目录 `.memory/`；Redis负责版本化会话热缓存与事件唤醒。设计、失效和故障回退见 [Redis接入说明](interview/backend-engineering-interview-guide.md#cache)。
 
 顶栏可进入 Agent 工作台和资料库。左侧的 **Skills** 列出当前工作目录 `skills/` 中的技能，子目录用于分组。点击技能可在站内抽屉查看 `SKILL.md` 原文。会话创建与切换单独放在侧栏。迁移来源见 `interfaces/web/frontend/MIGRATION.md`。
 
@@ -138,7 +152,8 @@ agent-harness/                 # 仓库目录；安装后的 Python 包名是 ag
 │   ├── tasks.py                # JSON 任务仓库与文件事务锁
 │   ├── git.py                  # Git / worktree 命令适配
 │   ├── mailbox.py              # 文件消息总线
-│   ├── mcp.py                  # 原有进程内模拟 MCP 适配
+│   ├── mcp.py                  # MCP 工具发现、注册与审批策略
+│   ├── mcp_stdio.py            # Docker MCP stdio 客户端
 │   └── platform.py             # Windows / Unix 锁与进程清理
 ├── interfaces/
 │   ├── cli.py                 # 终端输入与展示
@@ -221,6 +236,19 @@ HTTP 提交立即返回 `202`，执行进入会话的工作线程。SSE 按事�
 
 默认静态模式只有一个 Python 服务。开发模式额外运行 Next，只允许启动参数指定的 loopback 前端 origin；不允许任意 CORS 或伪造转发头。`/api/agent/*` 与原 `/api/*` 使用同一个路由与权限政策。事件流带有 `no-transform`，避免代理压缩缓冲阻止及时显示工具和审批。重放请求在固定事件上界内读取全部分页，刷新后用持久事件恢复对话。
 
+### arXiv 与 Wikipedia MCP
+
+启动 Docker Desktop 后，在普通对话中请 Agent 用 `wikipedia` 搜索词条，或用 `arxiv` 搜论文。首次使用时 Agent 调用 `connect_mcp` 发现工具。后端以 stdio 启动本机镜像，工具调用结束后移除容器。若当前 Docker 引擎里缺少镜像，先运行以下命令。
+
+```powershell
+docker pull mcp/arxiv-mcp-server
+docker pull mcp/wikipedia-mcp
+```
+
+试用提示词 `把 arXiv 1706.03762v7 的原始 PDF 导入资料库`。确认工具请求后，`mcp__arxiv__import_pdf` 从 arXiv 获取原始 PDF，复用上传校验、去重、存储和索引队列。导入的论文可在资料库预览、下载和检索，原件与网页上传文件一起存入 `.runtime/agent-harness/library/originals/<文件ID>/<版本ID>/source.pdf`。
+
+镜像自带的 `download_paper` 用于转换论文为 Markdown，转换缓存保存在容器 `/app/papers` 对应的 `.runtime/agent-harness/library/mcp-arxiv/`。Wikipedia 工具不需要挂载目录。 [arXiv 镜像](https://hub.docker.com/mcp/server/arxiv-mcp-server/overview) · [Wikipedia 镜像](https://hub.docker.com/mcp/server/wikipedia-mcp/overview)
+
 ## 扩展方式
 
 新增能力时，先在 `services/` 实现具有明确依赖的服务，外部连接放在 `infrastructure/`，再用 `tools/schemas.py` 和 `tools/builtins.py` 注册需要暴露的工具。也可以直接调用 `runtime.registry.register(schema, handler)` 注册工具，不需要修改核心循环。
@@ -231,7 +259,7 @@ HTTP 提交立即返回 `202`，执行进入会话的工作线程。SSE 按事�
 
 ```powershell
 . .\.venv\Scripts\Activate.ps1
-uv sync --frozen --extra test --extra browser
+uv sync --frozen --extra test --extra browser --extra milvus --extra redis
 .\scripts\project.ps1 deps
 npm --prefix interfaces/web/frontend run typecheck
 $env:NEXT_TELEMETRY_DISABLED = '1'
@@ -243,7 +271,7 @@ python -m ruff format --check application core infrastructure interfaces service
 
 普通测试使用模型替身，验证实际工具、存储、任务、团队协议、后台执行、HTTP、SSE、审批、并发拒绝、取消与恢复。浏览器测试启动真实本地服务器，用无界面 Edge 完成对话、权限确认、刷新恢复和移动端布局检查；其他平台可设置 `HARNESS_BROWSER_EXECUTABLE` 指向已安装的 Chromium 浏览器，没有可用浏览器时跳过该项。测试不会调用在线模型 API。
 
-面试用的功能覆盖、优化前后性能数据、生产问题分析、私有部署与多租户方案集中在 [面试复习索引](docs/interview/README.md)。性能工具使用独立合成数据与模拟提供商，结果描述本地实现开销，不代表线上模型容量。
+面试用的功能覆盖、优化前后性能数据、生产问题分析、私有部署与多租户方案集中在 [后端工程手册](interview/backend-engineering-interview-guide.md)，其他专题见 [Agent Harness](interview/agent-development-interview-guide.md)、[Agentic RAG](interview/crud-rag-interview-guide.md)与 [发散问题](interview/ai-product-and-coding-interview-guide.md)。性能工具使用独立合成数据与模拟提供商，结果描述本地实现开销，不代表线上模型容量。
 
 ## 过程文件管理
 

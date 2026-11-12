@@ -32,7 +32,28 @@ class MCPClient:
 
 
 class MCPService:
-    def __init__(self):
+    DOCKER_IMAGES = {
+        "arxiv": "mcp/arxiv-mcp-server",
+        "wikipedia": "mcp/wikipedia-mcp",
+    }
+    SERVER_ALIASES = {"arxiv-mcp-server": "arxiv", "wikipedia-mcp": "wikipedia"}
+    WIKIPEDIA_READ_TOOLS = {
+        "extract_key_facts",
+        "get_article",
+        "get_coordinates",
+        "get_links",
+        "get_related_topics",
+        "get_sections",
+        "get_summary",
+        "search_wikipedia",
+        "summarize_article_for_query",
+        "summarize_article_section",
+        "test_wikipedia_connectivity",
+    }
+
+    def __init__(self, *, arxiv_storage=None, import_pdf=None):
+        self.arxiv_storage = arxiv_storage
+        self.import_pdf = import_pdf
         self._init_mcp()
 
     def _init_mcp(self):
@@ -44,6 +65,16 @@ class MCPService:
             ("deploy", "status"): "allow",
             ("deploy", "trigger"): "confirm",
         }
+        self.MCP_HOST_POLICY.update(
+            {("arxiv", name): "allow" for name in ("search_papers", "list_papers", "read_paper")}
+        )
+        self.MCP_HOST_POLICY.update(
+            {
+                ("wikipedia", prefix + name): "allow"
+                for prefix in ("", "wikipedia_")
+                for name in self.WIKIPEDIA_READ_TOOLS
+            }
+        )
         self.MOCK_SERVERS = {
             "docs": self._mock_server_docs,
             "deploy": self._mock_server_deploy,
@@ -117,17 +148,45 @@ class MCPService:
         return client
 
     def connect_mcp(self, name: str) -> str:
+        name = self.SERVER_ALIASES.get(name, name)
         if name in self.mcp_clients:
             return f"MCP server '{name}' already connected"
         factory = self.MOCK_SERVERS.get(name)
+        if name in self.DOCKER_IMAGES:
+            factory = lambda: self._connect_docker(name)
         if not factory:
-            available = ", ".join(self.MOCK_SERVERS)
+            available = ", ".join([*self.DOCKER_IMAGES, *self.MOCK_SERVERS])
             return f"Unknown server '{name}'. Available: {available}"
-        mcp_client = factory()
+        try:
+            mcp_client = factory()
+        except Exception as error:
+            return (
+                f"MCP error: could not connect to '{name}' ({type(error).__name__}). "
+                f"Check Docker Desktop and the local image {self.DOCKER_IMAGES.get(name, name)}."
+            )
         self.mcp_clients[name] = mcp_client
         tool_names = [tool["name"] for tool in mcp_client.tools]
         print(f"  \x1b[31m[mcp] connected: {name} -> {tool_names}\x1b[0m")
         return f"Connected to MCP server '{name}'. Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}"
+
+    def _connect_docker(self, name):
+        from .library import LibraryBlobStore
+        from .mcp_stdio import DockerMCPClient
+
+        storage = self.arxiv_storage if name == "arxiv" else None
+        if storage is not None:
+            LibraryBlobStore._assert_plain(storage)
+            storage.mkdir(parents=True, exist_ok=True)
+        return DockerMCPClient(self.DOCKER_IMAGES[name], storage=storage)
+
+    def _handler(self, server, client, tool):
+        if server == "arxiv" and tool == "import_pdf" and self.import_pdf:
+            return self.import_pdf
+
+        def call(**arguments):
+            return client.call_tool(tool, arguments)
+
+        return call
 
     def assemble_tool_pool(self, builtin_tools, builtin_handlers) -> tuple[list[dict], dict]:
         """Merge builtin tools + all MCP tools into one pool."""
@@ -137,7 +196,24 @@ class MCPService:
         origins = {tool["name"]: f"built-in tool {tool['name']!r}" for tool in tools}
         for server_name, mcp_client in self.mcp_clients.items():
             safe_server = self.normalize_mcp_name(server_name)
-            for tool_def in mcp_client.tools:
+            tool_defs = mcp_client.tools
+            if server_name == "arxiv" and self.import_pdf:
+                tool_defs = [
+                    *tool_defs,
+                    {
+                        "name": "import_pdf",
+                        "description": "Download the original PDF from arXiv by paper ID and add it "
+                        "to the local file library for preview, download and indexing. Use this to "
+                        "save a PDF. The server's download_paper tool converts papers to Markdown.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"paper_id": {"type": "string"}},
+                            "required": ["paper_id"],
+                            "additionalProperties": False,
+                        },
+                    },
+                ]
+            for tool_def in tool_defs:
                 raw_name = tool_def["name"]
                 safe_tool = self.normalize_mcp_name(raw_name)
                 prefixed = f"mcp__{safe_server}__{safe_tool}"
@@ -159,9 +235,7 @@ class MCPService:
                         "input_schema": schema,
                     }
                 )
-                handlers[prefixed] = lambda *, client=mcp_client, tool=raw_name, **kwargs: (
-                    client.call_tool(tool, kwargs)
-                )
+                handlers[prefixed] = self._handler(server_name, mcp_client, raw_name)
                 policies[prefixed] = self.MCP_HOST_POLICY.get((server_name, raw_name), "confirm")
         self.mcp_tool_policies = policies
         return (tools, handlers)

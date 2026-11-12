@@ -9,6 +9,7 @@ from datetime import datetime
 
 from ..core.messages import json_value, repair_interrupted_turn
 from ..infrastructure.sessions import SessionRepository
+from ..infrastructure.session_cache import RedisSessionCache
 from ..services.library_rag import library_options
 from ..services.scheduler import Scheduler
 from .approvals import ApprovalBroker
@@ -38,12 +39,18 @@ class LiveSession:
 
 
 class SessionService:
-    def __init__(self, config, client_factory, *, retrieval=None, resume_schedules=False):
+    def __init__(self, config, client_factory, *, retrieval=None, library=None, resume_schedules=False):
         self.config = config
         self.client_factory = client_factory
         self.retrieval = retrieval
+        self.library = library
         self.resume_schedules = resume_schedules
-        self.repository = SessionRepository(config.data_dir / "sessions.sqlite3")
+        database_path = config.data_dir / "sessions.sqlite3"
+        cache = RedisSessionCache(
+            config.redis_url, database_path,
+            prefix=config.redis_prefix, ttl=config.redis_cache_ttl,
+        ) if config.redis_url else None
+        self.repository = SessionRepository(database_path, cache=cache)
         self.session_root = config.data_dir / "sessions"
         self.sessions = {}
         self.retiring_schedulers = {}
@@ -54,6 +61,7 @@ class SessionService:
 
     def start(self):
         if self.pump is None:
+            self.repository.start()
             for session_id in self.repository.pending_cleanup():
                 self._cleanup_deleted(session_id)
             if self.resume_schedules:
@@ -82,6 +90,7 @@ class SessionService:
             emit=emit,
             memory_lock=self.memory_lock,
             retrieval=self.retrieval,
+            library=self.library,
             personalized=record["personalized"],
             temporary=record["temporary"],
         )
@@ -379,3 +388,4 @@ class SessionService:
                 session.worker.join(timeout=1)
         if self.pump:
             self.pump.join(timeout=1)
+        self.repository.close()

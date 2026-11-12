@@ -10,6 +10,7 @@ from uuid import uuid4
 from ..infrastructure.embeddings import BailianEmbeddings, EmbeddingError
 from ..infrastructure.library import timestamp
 from ..infrastructure.library_vectors import QdrantLibraryIndex, VectorIndexError
+from ..infrastructure.milvus_vectors import MilvusLibraryIndex, vector_identifier
 from ..infrastructure.reranking import BailianReranker, RerankError
 from .library import LibraryError
 
@@ -41,6 +42,7 @@ class RetrievalService:
             else None
         )
         self.profile = None
+        self.embedding_profile = None
         self.vectors = vector_index
         self._own_vectors = vector_index is None
         self._own_provider = False
@@ -71,6 +73,14 @@ class RetrievalService:
                     ).encode()
                 ).hexdigest()
             )
+            self.embedding_profile = self.profile
+            if config.vector_backend == "milvus":
+                self.profile = hashlib.sha256(json.dumps({
+                    "embedding": self.embedding_profile, "backend": "milvus",
+                    "uri": config.milvus_uri.rstrip("/"),
+                    "collection_prefix": config.milvus_collection_prefix,
+                    "workspace": str(config.data_dir),
+                }, sort_keys=True).encode()).hexdigest()
         with self.repository.connection() as database:
             database.executescript("""
                 CREATE TABLE IF NOT EXISTS library_embedding_cache (
@@ -87,6 +97,13 @@ class RetrievalService:
                     ON library_vector_jobs(profile,document_id,seq DESC);
                 CREATE INDEX IF NOT EXISTS library_vectors_state
                     ON library_vector_jobs(profile,status,seq);
+                CREATE TABLE IF NOT EXISTS library_chunk_vectors (
+                    id TEXT PRIMARY KEY, job_id TEXT NOT NULL, profile TEXT NOT NULL,
+                    document_id TEXT NOT NULL, version_id TEXT NOT NULL,
+                    section_id TEXT, chunk_id TEXT NOT NULL, backend TEXT NOT NULL,
+                    model TEXT NOT NULL, dimensions INTEGER NOT NULL, created_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS library_chunk_vectors_document
+                    ON library_chunk_vectors(document_id,version_id,chunk_id);
             """)
         library.retrieval = self
 
@@ -127,20 +144,31 @@ class RetrievalService:
             if self._closed:
                 raise VectorIndexError("Semantic retrieval has stopped")
             if self.vectors is None:
-                index = QdrantLibraryIndex(
-                    self.config.data_dir / "library" / "vectors" / self.profile,
-                    self.config.embedding_dimensions,
-                )
+                if self.config.vector_backend == "milvus":
+                    namespace = hashlib.sha256(str(self.config.data_dir).encode()).hexdigest()[:16]
+                    collection = f"{self.config.milvus_collection_prefix}_{namespace}_{self.profile[:16]}"
+                    index = MilvusLibraryIndex(
+                        self.config.milvus_uri, self.config.embedding_dimensions, collection,
+                        token=self.config.milvus_token,
+                    )
+                else:
+                    index = QdrantLibraryIndex(
+                        self.config.data_dir / "library" / "vectors" / self.profile,
+                        self.config.embedding_dimensions,
+                    )
                 # SQLite may survive loss of a vector directory. Restore from
                 # cached embeddings instead of trusting an empty/new collection.
                 try:
                     with self.repository.connection() as database:
                         rows = database.execute(
-                            "SELECT id,chunk_count FROM library_vector_jobs WHERE profile=? AND status='ready'",
-                            (self.profile,),
+                            "SELECT j.id,j.chunk_count,(SELECT COUNT(*) FROM library_chunk_vectors v "
+                            "WHERE v.job_id=j.id AND v.backend=?) AS mapped "
+                            "FROM library_vector_jobs j WHERE j.profile=? AND j.status='ready'",
+                            (self.config.vector_backend, self.profile),
                         ).fetchall()
                     for row in rows:
-                        if index.created or index.count_job(row["id"]) != row["chunk_count"]:
+                        if (index.created or row["mapped"] != row["chunk_count"]
+                                or index.count_job(row["id"]) != row["chunk_count"]):
                             with self.repository.connection() as database:
                                 database.execute(
                                     "UPDATE library_vector_jobs SET status='cancelled',updated_at=? WHERE id=?",
@@ -168,7 +196,8 @@ class RetrievalService:
         if favorites_only:
             clauses.append("f.favorite=1")
         rows = database.execute(
-            "SELECT f.id,f.version_id,COUNT(c.id) AS chunk_count,GROUP_CONCAT(c.id) AS chunk_ids "
+            "SELECT f.id,f.version_id,COUNT(c.id) AS chunk_count,"
+            "GROUP_CONCAT(c.id || ':' || COALESCE(c.section_id,'') || ':' || c.content_type) AS chunk_ids "
             "FROM library_files f JOIN library_ingestion_jobs j ON j.document_id=f.id "
             "AND j.version_id=f.version_id JOIN library_chunks c ON c.document_id=f.id "
             f"WHERE {' AND '.join(clauses)} GROUP BY f.id,f.version_id",
@@ -258,6 +287,8 @@ class RetrievalService:
             "configured": self.configured,
             "model": self.config.embedding_model,
             "dimensions": self.config.embedding_dimensions,
+            "vector_backend": self.config.vector_backend,
+            "keyword_backend": "application_bm25",
             "ready_documents": ready,
             "indexed_documents": ready,
             "total_documents": total,
@@ -375,7 +406,7 @@ class RetrievalService:
             and self._matches(job, document)
         )
 
-    def _finish(self, job, state, error=None, count=0):
+    def _finish(self, job, state, error=None, count=0, chunks=None):
         with self.repository.connection() as database:
             if not self._active(database, job):
                 return False
@@ -384,6 +415,14 @@ class RetrievalService:
                 "WHERE id=?",
                 (state, error, count, timestamp(), job["id"]),
             )
+            if state == "ready" and chunks is not None:
+                database.executemany(
+                    "INSERT OR REPLACE INTO library_chunk_vectors VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    [(vector_identifier(job["id"], chunk["id"]), job["id"], self.profile,
+                      job["document_id"], job["version_id"], chunk.get("section_id"), chunk["id"],
+                      self.config.vector_backend, self.config.embedding_model,
+                      self.config.embedding_dimensions, timestamp()) for chunk in chunks],
+                )
             return True
 
     def _cached_embeddings(self, chunks, job):
@@ -396,7 +435,7 @@ class RetrievalService:
             for digest in list(missing):
                 row = database.execute(
                     "SELECT vector FROM library_embedding_cache WHERE profile=? AND text_hash=?",
-                    (self.profile, digest),
+                    (self.embedding_profile, digest),
                 ).fetchone()
                 if row:
                     try:
@@ -415,7 +454,7 @@ class RetrievalService:
                     except (ValueError, TypeError, OverflowError):
                         database.execute(
                             "DELETE FROM library_embedding_cache WHERE profile=? AND text_hash=?",
-                            (self.profile, digest),
+                            (self.embedding_profile, digest),
                         )
         pending = list(missing.items())
         for first in range(0, len(pending), 10):
@@ -432,7 +471,7 @@ class RetrievalService:
                 for (digest, _), vector in zip(batch, vectors):
                     database.execute(
                         "INSERT OR REPLACE INTO library_embedding_cache VALUES (?,?,?,?)",
-                        (self.profile, digest, json.dumps(vector, allow_nan=False), timestamp()),
+                        (self.embedding_profile, digest, json.dumps(vector, allow_nan=False), timestamp()),
                     )
                     values[digest] = vector
         return [values[chunk["text_hash"]] for chunk in chunks]
@@ -457,7 +496,7 @@ class RetrievalService:
             if not active:
                 return
             self._ensure_vectors().upsert(job["id"], chunks, vectors)
-            if not self._finish(job, "ready", count=len(chunks)):
+            if not self._finish(job, "ready", count=len(chunks), chunks=chunks):
                 self._ensure_vectors().delete_job(job["id"])
         except InterruptedError:
             self._finish(job, "queued")
@@ -487,6 +526,23 @@ class RetrievalService:
                 database.execute(
                     "UPDATE library_vector_jobs SET cleaned=1 WHERE id=?", (identifier,)
                 )
+                database.execute("DELETE FROM library_chunk_vectors WHERE job_id=?", (identifier,))
+
+    def document_vectors(self, document_id):
+        with self.repository.connection() as database:
+            rows = database.execute(
+                "SELECT v.* FROM library_chunk_vectors v "
+                "JOIN library_vector_jobs j ON j.id=v.job_id "
+                "JOIN library_files f ON f.id=v.document_id "
+                "JOIN library_chunks c ON c.id=v.chunk_id "
+                "WHERE v.document_id=? AND v.profile=? AND v.backend=? "
+                "AND f.deleted_at IS NULL AND f.version_id=v.version_id "
+                "AND c.section_id=v.section_id "
+                "AND j.status='ready' AND j.seq=(SELECT MAX(k.seq) FROM library_vector_jobs k "
+                "WHERE k.profile=j.profile AND k.document_id=j.document_id)",
+                (document_id, self.profile, self.config.vector_backend),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def _run(self):
         try:

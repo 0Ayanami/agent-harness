@@ -17,6 +17,14 @@ class DocumentParseError(ValueError):
         self.needs_ocr = needs_ocr
 
 
+class ParsedChunks(list):
+    """List-compatible parser result with its explicit section tree attached."""
+
+    def __init__(self, chunks, sections):
+        super().__init__(chunks)
+        self.sections = sections
+
+
 class KeywordTokenizer:
     """A private tokenizer whose optional dictionary cache stays in managed artifacts."""
 
@@ -55,16 +63,45 @@ class DocumentParser:
     OVERLAP_CHARACTERS = 150
 
     def parse(self, path, extension):
+        document = self.parse_document(path, extension)
+        return ParsedChunks(document["chunks"], document["sections"])
+
+    def parse_document(self, path, extension):
+        """Extract a bounded native-text document and its hierarchy.
+
+        Section keys are local to this parse; persistence assigns version-scoped
+        IDs. Content types and extraction metadata leave room for later OCR and
+        table/image processors without claiming those processors are available.
+        """
         if extension == "pdf":
-            sections = self._pdf(path)
+            sections = [self._section("root", None, 0, "document", None, "", {})]
+            for text, location in self._pdf(path):
+                sections.append(self._section(
+                    f"page-{location['page']}", "root", 1, "page",
+                    f"Page {location['page']}", text, location,
+                    metadata={"extraction_method": "pypdf_native_text"},
+                ))
         else:
             sections = self._text(path, markdown=extension == "md")
         chunks = []
-        for text, location in sections:
-            chunks.extend(self._chunks(text, location))
+        for ordinal, section in enumerate(sections):
+            section["ordinal"] = ordinal
+            for chunk in self._chunks(section["text"], section["location"]):
+                chunks.append({
+                    **chunk, "section_key": section["key"], "content_type": "text",
+                    "metadata": {"extraction_method": section["metadata"]["extraction_method"]},
+                })
         if not chunks:
             raise DocumentParseError("No readable text was found in this document")
-        return chunks
+        return {"sections": sections, "chunks": chunks}
+
+    @staticmethod
+    def _section(key, parent_key, level, kind, title, text, location, *, metadata=None):
+        return {
+            "key": key, "parent_key": parent_key, "level": level, "kind": kind,
+            "title": title, "text": text, "location": location,
+            "metadata": metadata or {"extraction_method": "native_text"},
+        }
 
     def _text(self, path, *, markdown):
         try:
@@ -81,18 +118,49 @@ class DocumentParser:
         if len(text) > self.MAX_CHARACTERS:
             raise DocumentParseError("Document text exceeds the 2,000,000 character limit")
         text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+        root = self._section("root", None, 0, "document", None, text, {"start_line": 1})
         if not markdown:
-            return [(text, {"start_line": 1})]
-        sections, lines, first, heading = [], [], 1, None
+            root["location"]["end_line"] = max(1, len(text.splitlines()))
+            return [root]
+        sections, stack, lines, current = [root], [root], [], root
+        fence = None
+
+        def finish():
+            current["text"] = "".join(lines)
+            current["location"]["end_line"] = (
+                current["location"]["start_line"] + max(0, len(current["text"].splitlines()) - 1)
+            )
+
         for number, line in enumerate(text.splitlines(keepends=True), 1):
-            match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+            marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\n"))
+            if fence is not None:
+                lines.append(line)
+                if marker and marker[1][0] == fence[0] and len(marker[1]) >= fence[1] and not marker[2].strip():
+                    fence = None
+                continue
+            if marker and (marker[1][0] == "~" or "`" not in marker[2]):
+                fence = (marker[1][0], len(marker[1]))
+                lines.append(line)
+                continue
+            match = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*)|$)", line.rstrip("\n"))
             if match:
-                if lines:
-                    sections.append(("".join(lines), {"start_line": first, "heading": heading}))
-                lines, first, heading = [], number, match.group(1).strip()
+                finish()
+                level = len(match[1])
+                heading = re.sub(r"[ \t]+#+[ \t]*$", "", match[2] or "").strip()
+                while stack[-1]["level"] >= level:
+                    stack.pop()
+                parent = stack[-1]
+                ancestors = [item["title"] for item in stack if item["title"]]
+                current = self._section(
+                    f"section-{len(sections)}", parent["key"], level, "section", heading, "",
+                    {"start_line": number, "heading": heading, "heading_path": [*ancestors, heading]},
+                    metadata={"extraction_method": "markdown_native_text"},
+                )
+                sections.append(current)
+                stack.append(current)
+                lines = []
             lines.append(line)
-        if lines:
-            sections.append(("".join(lines), {"start_line": first, "heading": heading}))
+        finish()
         return sections
 
     def _check_page_streams(self, page):

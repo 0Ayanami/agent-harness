@@ -31,6 +31,13 @@ class LibraryIndexRepository:
                     location TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS library_chunk_version
                     ON library_chunks(document_id,version_id,ordinal);
+                CREATE TABLE IF NOT EXISTS library_sections (
+                    id TEXT PRIMARY KEY, document_id TEXT NOT NULL, version_id TEXT NOT NULL,
+                    parent_id TEXT, ordinal INTEGER NOT NULL, title TEXT,
+                    level INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+                    location TEXT NOT NULL, metadata TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS library_section_version
+                    ON library_sections(document_id,version_id,ordinal);
                 CREATE VIRTUAL TABLE IF NOT EXISTS library_chunk_fts USING fts5(tokens);
             """)
             columns = {
@@ -38,6 +45,36 @@ class LibraryIndexRepository:
             }
             if "lease_id" not in columns:
                 database.execute("ALTER TABLE library_ingestion_jobs ADD COLUMN lease_id TEXT")
+            columns = {row[1] for row in database.execute("PRAGMA table_info(library_chunks)")}
+            for name, declaration in (
+                ("section_id", "TEXT"),
+                ("content_type", "TEXT NOT NULL DEFAULT 'text'"),
+                ("metadata", "TEXT NOT NULL DEFAULT '{}'"),
+            ):
+                if name not in columns:
+                    database.execute(f"ALTER TABLE library_chunks ADD COLUMN {name} {declaration}")
+            # Existing chunks remain readable during migration. Give each legacy
+            # version an explicit root and reparse it on the next worker start.
+            legacy = database.execute(
+                "SELECT DISTINCT document_id,version_id FROM library_chunks WHERE section_id IS NULL"
+            ).fetchall()
+            for document in legacy:
+                identifier = self._section_id(document["document_id"], document["version_id"], "root")
+                database.execute(
+                    "INSERT OR IGNORE INTO library_sections VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (identifier, document["document_id"], document["version_id"], None,
+                     0, None, 0, "document", "", "{}", '{"needs_reparse":true}'),
+                )
+                database.execute(
+                    "UPDATE library_chunks SET section_id=? WHERE document_id=? AND version_id=? "
+                    "AND section_id IS NULL",
+                    (identifier, document["document_id"], document["version_id"]),
+                )
+            database.execute("INSERT OR IGNORE INTO library_index_schema VALUES (2)")
+
+    @staticmethod
+    def _section_id(document_id, version_id, key):
+        return uuid5(NAMESPACE_URL, f"library-section:{document_id}:{version_id}:{key}").hex
 
     @staticmethod
     def _job(row):
@@ -109,10 +146,15 @@ class LibraryIndexRepository:
                 (timestamp(),),
             )
             records = database.execute(
-                "SELECT id,version_id FROM library_files WHERE deleted_at IS NULL"
+                "SELECT f.id,f.version_id,EXISTS(SELECT 1 FROM library_sections s "
+                "WHERE s.document_id=f.id AND s.version_id=f.version_id "
+                "AND s.metadata LIKE '%\"needs_reparse\":true%') AS needs_reparse "
+                "FROM library_files f WHERE deleted_at IS NULL"
             ).fetchall()
         for record in records:
-            self.enqueue(record["id"])
+            # A failed retry is left visible; do not repeatedly requeue it on every restart.
+            status = self.statuses([record["id"]]).get(record["id"], {})
+            self.enqueue(record["id"], force=bool(record["needs_reparse"] and status.get("status") == "ready"))
 
     def claim(self):
         with self.repository.connection() as database:
@@ -180,6 +222,21 @@ class LibraryIndexRepository:
 
     def publish(self, job, chunks, *, should_publish=lambda: True):
         prepared = [(chunk, self.tokenizer.encode(chunk["text"])) for chunk in chunks]
+        sections = getattr(chunks, "sections", None) or [{
+            "key": "root", "parent_key": None, "ordinal": 0, "title": None,
+            "level": 0, "kind": "document", "text": "", "location": {},
+            "metadata": {"extraction_method": "legacy_parser"},
+        }]
+        section_ids = {
+            section["key"]: self._section_id(job["document_id"], job["version_id"], section["key"])
+            for section in sections
+        }
+        if len(section_ids) != len(sections):
+            raise ValueError("Parsed section keys must be unique")
+        if any(section.get("parent_key") is not None and section["parent_key"] not in section_ids for section in sections):
+            raise ValueError("Parsed section parents must belong to this document")
+        if any(chunk.get("section_key", "root") not in section_ids for chunk in chunks):
+            raise ValueError("Parsed chunks must belong to a section")
         with self.repository.connection() as database:
             if not should_publish():
                 if self._active(database, job):
@@ -191,6 +248,15 @@ class LibraryIndexRepository:
             if not self._active(database, job):
                 return False
             self._delete_chunks(database, job["document_id"])
+            for ordinal, section in enumerate(sections):
+                database.execute(
+                    "INSERT INTO library_sections VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (section_ids[section["key"]], job["document_id"], job["version_id"],
+                     section_ids.get(section.get("parent_key")), ordinal, section.get("title"),
+                     section["level"], section["kind"], section["text"],
+                     json.dumps(section["location"], ensure_ascii=False),
+                     json.dumps(section.get("metadata", {}), ensure_ascii=False)),
+                )
             for ordinal, (chunk, tokens) in enumerate(prepared):
                 digest = hashlib.sha256(chunk["text"].encode()).hexdigest()
                 identifier = uuid5(
@@ -198,8 +264,8 @@ class LibraryIndexRepository:
                     f"library:{job['document_id']}:{job['version_id']}:{ordinal}:{digest}",
                 ).hex
                 result = database.execute(
-                    "INSERT INTO library_chunks(id,document_id,version_id,ordinal,text,search_text,location) "
-                    "VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO library_chunks(id,document_id,version_id,ordinal,text,search_text,location,"
+                    "section_id,content_type,metadata) VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (
                         identifier,
                         job["document_id"],
@@ -208,6 +274,9 @@ class LibraryIndexRepository:
                         chunk["text"],
                         self.tokenizer.normalize(chunk["text"]),
                         json.dumps(chunk["location"], ensure_ascii=False),
+                        section_ids[chunk.get("section_key", "root")],
+                        chunk.get("content_type", "text"),
+                        json.dumps(chunk.get("metadata", {}), ensure_ascii=False),
                     ),
                 )
                 database.execute(
@@ -254,6 +323,7 @@ class LibraryIndexRepository:
             (document_id,),
         )
         database.execute("DELETE FROM library_chunks WHERE document_id=?", (document_id,))
+        database.execute("DELETE FROM library_sections WHERE document_id=?", (document_id,))
 
     def invalidate(self, document_id):
         with self.repository.connection() as database:
@@ -273,8 +343,46 @@ class LibraryIndexRepository:
             "name": row["name"],
             "text": row["text"],
             "location": json.loads(row["location"]),
+            "section_id": row["section_id"],
+            "content_type": row["content_type"],
+            "metadata": json.loads(row["metadata"]),
             "score": float(score),
         }
+
+    def structure(self, document_id):
+        """Return this document's current tree and chunks, bounded by parser limits."""
+        with self.repository.connection() as database:
+            record = database.execute(
+                "SELECT id,name,version_id FROM library_files WHERE id=? AND deleted_at IS NULL",
+                (document_id,),
+            ).fetchone()
+            if record is None:
+                raise KeyError(document_id)
+            sections = [
+                {**dict(row), "location": json.loads(row["location"]),
+                 "metadata": json.loads(row["metadata"]), "children": [], "chunks": []}
+                for row in database.execute(
+                    "SELECT * FROM library_sections WHERE document_id=? AND version_id=? ORDER BY ordinal",
+                    (document_id, record["version_id"]),
+                )
+            ]
+            chunks = [
+                self._hit(row) for row in database.execute(
+                    "SELECT c.*,f.name FROM library_chunks c JOIN library_files f ON f.id=c.document_id "
+                    "WHERE f.id=? AND f.deleted_at IS NULL AND c.version_id=f.version_id ORDER BY c.ordinal",
+                    (document_id,),
+                )
+            ]
+        by_id = {section["id"]: section for section in sections}
+        roots = []
+        for section in sections:
+            parent = by_id.get(section["parent_id"])
+            (parent["children"] if parent is not None else roots).append(section)
+        for chunk in chunks:
+            if chunk["section_id"] in by_id:
+                by_id[chunk["section_id"]]["chunks"].append(chunk)
+        return {"document_id": record["id"], "version_id": record["version_id"], "name": record["name"],
+                "section_count": len(sections), "chunk_count": len(chunks), "sections": roots}
 
     def read_chunk(self, document_id, chunk_id):
         with self.repository.connection() as database:

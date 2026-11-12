@@ -64,6 +64,13 @@ class HarnessConfig:
     rerank_base_url: str | None = None
     rerank_model: str = "qwen3-rerank"
     rerank_candidates: int = 20
+    vector_backend: str = "qdrant"
+    milvus_uri: str = "http://127.0.0.1:19530"
+    milvus_token: str | None = field(default=None, repr=False)
+    milvus_collection_prefix: str = "ayanami_library"
+    redis_url: str | None = field(default=None, repr=False)
+    redis_prefix: str = "ayanami"
+    redis_cache_ttl: int = 300
 
     def __post_init__(self):
         object.__setattr__(self, "workdir", Path(self.workdir).resolve())
@@ -77,6 +84,23 @@ class HarnessConfig:
             raise ValueError("RERANK_MODEL must not be empty")
         _validate_service_url(self.embedding_base_url, "EMBEDDING_BASE_URL")
         _validate_service_url(self.rerank_base_url, "RERANK_BASE_URL")
+        if self.vector_backend not in ("qdrant", "milvus"):
+            raise ValueError("VECTOR_BACKEND must be qdrant or milvus")
+        address = urlsplit(self.milvus_uri)
+        if (address.scheme not in ("http", "https") or not address.hostname
+                or address.username or address.password or address.query or address.fragment):
+            raise ValueError("MILVUS_URI must be an HTTP(S) server URL without credentials")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", self.milvus_collection_prefix):
+            raise ValueError("MILVUS_COLLECTION_PREFIX must be a short identifier")
+        if self.redis_url:
+            redis_address = urlsplit(self.redis_url)
+            if (redis_address.scheme not in ("redis", "rediss") or not redis_address.hostname
+                    or redis_address.query or redis_address.fragment):
+                raise ValueError("REDIS_URL must be a Redis URL without query parameters")
+        if not re.fullmatch(r"[A-Za-z0-9_:-]{1,64}", self.redis_prefix):
+            raise ValueError("REDIS_PREFIX must be a short namespace without wildcards")
+        if not 1 <= self.redis_cache_ttl <= 86400:
+            raise ValueError("REDIS_CACHE_TTL must be between 1 and 86400 seconds")
 
     @property
     def data_dir(self) -> Path:
@@ -118,6 +142,13 @@ class HarnessConfig:
             rerank_base_url=rerank_url,
             rerank_model=os.getenv("RERANK_MODEL") or "qwen3-rerank",
             rerank_candidates=int(os.getenv("RERANK_CANDIDATES") or "20"),
+            vector_backend=os.getenv("VECTOR_BACKEND") or "qdrant",
+            milvus_uri=os.getenv("MILVUS_URI") or "http://127.0.0.1:19530",
+            milvus_token=os.getenv("MILVUS_TOKEN") or None,
+            milvus_collection_prefix=os.getenv("MILVUS_COLLECTION_PREFIX") or "ayanami_library",
+            redis_url=os.getenv("REDIS_URL") or None,
+            redis_prefix=os.getenv("REDIS_PREFIX") or "ayanami",
+            redis_cache_ttl=int(os.getenv("REDIS_CACHE_TTL") or "300"),
         )
 
 

@@ -4,6 +4,7 @@ import logging
 import threading
 
 from ..infrastructure.document_parser import DocumentParseError, DocumentParser, KeywordTokenizer
+from ..infrastructure.application_bm25 import ApplicationBM25Index
 from ..infrastructure.library_index import LibraryIndexRepository
 from .library import LibraryError
 
@@ -15,6 +16,7 @@ class IngestionService:
         self.library = library
         self.parser = DocumentParser()
         self.index = LibraryIndexRepository(library.repository, KeywordTokenizer(cache_dir))
+        self.lexical = ApplicationBM25Index(self.index)
         self.shutdown = threading.Event()
         self.wake = threading.Event()
         self.thread = None
@@ -64,7 +66,7 @@ class IngestionService:
         query = query.strip()
         if not query:
             raise LibraryError(422, "Search query must not be empty")
-        hits = self.index.search(
+        hits = self.lexical.search(
             query, document_ids=document_ids, favorites_only=favorites_only, limit=limit
         )
         return {"mode": "keyword", "hits": hits, "warning": None}
@@ -81,6 +83,12 @@ class IngestionService:
         return self.index.read_chunks(
             chunk_ids, document_ids=document_ids, favorites_only=favorites_only
         )
+
+    def structure(self, document_id):
+        try:
+            return self.index.structure(document_id)
+        except KeyError:
+            raise LibraryError(404, "File not found") from None
 
     def _process(self, job):
         key = None

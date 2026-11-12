@@ -1,6 +1,5 @@
 """Thin HTTP adapter. All execution is delegated to application services."""
 
-import asyncio
 import json
 import time
 from contextlib import ExitStack, asynccontextmanager
@@ -74,7 +73,9 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
         library, cache_dir=config.workdir / ".artifacts" / "cache" / "jieba"
     )
     retrieval = RetrievalService(config, library, ingestion)
-    application = SessionService(config, client_factory, retrieval=retrieval, resume_schedules=True)
+    application = SessionService(
+        config, client_factory, retrieval=retrieval, library=library, resume_schedules=True
+    )
 
     @asynccontextmanager
     async def lifespan(app):
@@ -123,6 +124,7 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
             "model": config.model,
             "workdir": str(config.workdir),
             "interface": "web",
+            "redis": application.repository.cache_status(),
         }
 
     @router.get("/sessions")
@@ -241,6 +243,7 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
         last_event_id: int = Header(default=0, alias="Last-Event-ID"),
     ):
         cursor = max(after, last_event_id)
+        notification_version = application.repository.notification_version(session_id)
         page = await run_in_threadpool(
             application.repository.event_page, session_id, cursor, snapshot=once
         )
@@ -249,6 +252,7 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
 
         async def stream():
             current_page, current_cursor = page, cursor
+            observed_version = notification_version
             upper_bound = page["through"]
             deadline = time.monotonic() + 15
             while not application.shutdown.is_set():
@@ -271,7 +275,15 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
                 ):
                     return
                 yield ": keepalive\n\n"
-                await asyncio.sleep(0.3)
+                # Pub/Sub is only a wakeup hint. Sampling before the SQLite
+                # read closes the notify/read/wait race; a bounded timeout
+                # still replays durable rows after dropped notifications.
+                if len(batch) < 200:
+                    await application.repository.wait_for_events(
+                        session_id, observed_version,
+                        timeout=min(2.0, max(0.0, deadline - time.monotonic())),
+                    )
+                observed_version = application.repository.notification_version(session_id)
                 # SQLite may wait on a writer or filesystem I/O. One worker call
                 # reads the whole page without blocking unrelated ASGI requests.
                 current_page = await run_in_threadpool(

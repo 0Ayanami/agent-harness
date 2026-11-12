@@ -277,7 +277,9 @@ BUILTIN_SCHEMAS = [
     },
     {
         "name": "connect_mcp",
-        "description": "Connect to an MCP server (docs, deploy) and discover tools.",
+        "description": "Discover tools from arxiv (paper search, Markdown reading and original PDF "
+        "import into the local file library) or wikipedia (article search and reading). "
+        "The docs and deploy servers are local demos.",
         "input_schema": {
             "type": "object",
             "properties": {"name": {"type": "string"}},

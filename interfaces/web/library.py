@@ -95,6 +95,28 @@ def library_router(service, require_local_client, *, retrieval=None):
     def read_indexed_chunk(file_id: str, chunk_id: str):
         return invoke(ingestion_service().read_chunk, file_id, chunk_id)
 
+    @router.get("/files/{file_id}/structure")
+    def document_structure(file_id: str):
+        result = invoke(ingestion_service().structure, file_id)
+        records = retrieval.document_vectors(file_id) if retrieval is not None else []
+        by_chunk = {}
+        for record in records:
+            by_chunk.setdefault(record["chunk_id"], []).append(record)
+
+        def decorate(sections):
+            for section in sections:
+                for chunk in section.get("chunks", []):
+                    chunk["vectors"] = by_chunk.get(chunk["chunk_id"], [])
+                decorate(section.get("children", []))
+
+        decorate(result["sections"])
+        if invoke(service.get, file_id)["version_id"] != result["version_id"]:
+            raise HTTPException(409, "Document changed while its structure was being read; retry")
+        records = [record for record in records if record["version_id"] == result["version_id"]]
+        result["vector_count"] = len(records)
+        result["vector_backend"] = retrieval.config.vector_backend if retrieval else None
+        return result
+
     @router.get("/files")
     def list_files(
         q: str = Query(default="", max_length=255),

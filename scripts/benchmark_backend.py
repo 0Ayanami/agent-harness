@@ -48,6 +48,7 @@ class Provider(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     counts = Counter()
     guard = threading.Lock()
+    dimensions = 64
 
     def log_message(self, *_):
         pass
@@ -61,7 +62,11 @@ class Provider(BaseHTTPRequestHandler):
             rows = []
             for index, value in enumerate(body["input"]):
                 digest = hashlib.sha256(value.encode()).digest()
-                rows.append({"index": index, "embedding": [(digest[i % 32] - 127) / 128 for i in range(64)]})
+                vector_bytes = (
+                    digest * 2 if self.dimensions == 64
+                    else hashlib.shake_256(value.encode()).digest(self.dimensions)
+                )
+                rows.append({"index": index, "embedding": [(value - 127) / 128 for value in vector_bytes]})
             value = {"model": body["model"], "data": rows}
         else:
             time.sleep(0.01)
@@ -116,7 +121,7 @@ async def measure(name, count, concurrency, operation):
     return result
 
 
-async def workload(base, app, count):
+async def workload(base, app, count, *, rag_only=False):
     results = []
     async with httpx.AsyncClient(base_url=base, headers=HEADERS, timeout=60, trust_env=False,
                                  limits=httpx.Limits(max_connections=160, max_keepalive_connections=100,
@@ -128,8 +133,9 @@ async def workload(base, app, count):
 
         sessions = [await create() for _ in range(32)]
         repository = app.state.application.repository
-        for i in range(240):
-            repository.emit(sessions[0], "benchmark", {"index": i, "text": "synthetic event"})
+        if not rag_only:
+            for i in range(240):
+                repository.emit(sessions[0], "benchmark", {"index": i, "text": "synthetic event"})
         # Thirty documents, approximately 180 chunks. No real user material is used.
         identifiers = []
         for i in range(30):
@@ -138,7 +144,7 @@ async def workload(base, app, count):
             response = await client.post("/api/agent/library/files", files={"file": (f"note-{i}.md", value)})
             response.raise_for_status()
             identifiers.append(response.json()["id"])
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + (240 if rag_only else 90)
         while True:
             state = (await client.get("/api/agent/library/retrieval")).json()
             if state.get("ready_documents") == len(identifiers):
@@ -170,20 +176,22 @@ async def workload(base, app, count):
                     app.state.application.delete(record["id"])
             assert {record["id"] for record in repository.list()} == set(sessions)
 
-        for c in (1, 16, 64):
-            results.append(await measure("health", count, c, lambda _: get("/api/agent/health")))
-            results.append(await measure("session_list", count, c, lambda _: get("/api/agent/sessions")))
-            results.append(await measure("event_replay_240", count, c, replay))
-        for c in (1, 8, 32):
-            results.append(await measure("session_create_delete", max(32, count // 2), c, lifecycle))
-            restore_fixture_sessions()
+        if not rag_only:
+            for c in (1, 16, 64):
+                results.append(await measure("health", count, c, lambda _: get("/api/agent/health")))
+                results.append(await measure("session_list", count, c, lambda _: get("/api/agent/sessions")))
+                results.append(await measure("event_replay_240", count, c, replay))
+            for c in (1, 8, 32):
+                results.append(await measure("session_create_delete", max(32, count // 2), c, lifecycle))
+                restore_fixture_sessions()
 
         async def search(mode, _):
             response = await client.post("/api/agent/library/search", json={
                 "query": "知识库 检索 latency", "mode": mode, "limit": 8})
             response.raise_for_status()
             result = response.json()
-            if not result["hits"] or not result["reranked"] or result["mode"] != mode:
+            if (not result["hits"] or not result["reranked"] or result["mode"] != mode
+                    or (rag_only and result.get("warning"))):
                 raise AssertionError(f"Invalid search result in {mode}")
             return response.status_code
 
@@ -192,7 +200,7 @@ async def workload(base, app, count):
                 results.append(await measure("search_" + mode, max(24, count // 2), c,
                                              lambda i, mode=mode: search(mode, i)))
 
-        for rag in (False, True):
+        for rag in ((True,) if rag_only else (False, True)):
             for c in (1, 8):
                 # Reused sessions keep the fixture count fixed across variants.
                 async def turn(i):
@@ -219,10 +227,20 @@ async def workload(base, app, count):
                                 raise AssertionError("Turn did not deliver an answer")
                             if rag and not any(event["kind"] == "library_answer" and event["payload"].get("citations") for event in observed):
                                 raise AssertionError("RAG answer did not contain a current citation")
+                            if rag_only and not any(
+                                event["kind"] == "library_retrieval"
+                                and event["payload"].get("mode") == "hybrid"
+                                and event["payload"].get("reranked")
+                                and not event["payload"].get("warning") for event in observed
+                            ):
+                                raise AssertionError("RAG turn did not complete hybrid retrieval and reranking")
                             return 200
                         await asyncio.sleep(0.01)
                     raise TimeoutError("Turn did not finish")
                 results.append(await measure("rag_turn" if rag else "chat_turn", 24, c, turn))
+
+        if rag_only:
+            return results
 
         # Open actual long SSE connections, then measure unrelated request latency.
         stop = asyncio.Event()
@@ -255,20 +273,26 @@ def main():
     parser.add_argument("--label", required=True)
     parser.add_argument("--requests", type=int, default=120)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--rag-only", action="store_true")
+    parser.add_argument("--vector-backend", choices=("qdrant", "milvus"), default="qdrant")
+    parser.add_argument("--dimensions", type=int, choices=(64, 1024), default=64)
     args = parser.parse_args()
     if args.requests < 24:
         parser.error("Use at least 24 requests")
     root = Path(__file__).resolve().parents[1]
     workdir = root / ".artifacts" / "performance" / (args.label + "-" + uuid4().hex[:8])
     workdir.mkdir(parents=True)
+    Provider.dimensions = args.dimensions
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
     provider.daemon_threads = True
     threading.Thread(target=provider.serve_forever, daemon=True).start()
     endpoint = f"http://127.0.0.1:{provider.server_port}"
     config = HarnessConfig(workdir, "synthetic-model-50ms", embedding_api_key="synthetic",
-                           embedding_base_url=endpoint, embedding_model="synthetic-hash-64",
-                           embedding_dimensions=64, rerank_api_key="synthetic",
-                           rerank_base_url=endpoint + "/rerank", rerank_model="synthetic-rank-10ms")
+                           embedding_base_url=endpoint, embedding_model=f"synthetic-hash-{args.dimensions}",
+                           embedding_dimensions=args.dimensions, rerank_api_key="synthetic",
+                           rerank_base_url=endpoint + "/rerank", rerank_model="synthetic-rank-10ms",
+                           vector_backend=args.vector_backend,
+                           milvus_collection_prefix=f"ragbench_{uuid4().hex}")
     app = create_app(config, SyntheticModel)
     # Local fixtures must never use HTTP(S)_PROXY inherited from the desktop.
     app.state.retrieval.provider.client.close()
@@ -289,16 +313,28 @@ def main():
             if not thread.is_alive() or time.monotonic() - started > 15:
                 raise RuntimeError("Benchmark server failed to start")
             time.sleep(0.02)
-        results = asyncio.run(workload(f"http://127.0.0.1:{port}", app, args.requests))
+        results = asyncio.run(workload(f"http://127.0.0.1:{port}", app, args.requests, rag_only=args.rag_only))
+        retrieval = app.state.retrieval
+        storage = retrieval.status()
+        with retrieval.repository.connection() as database:
+            chunks = database.execute("SELECT COUNT(*) FROM library_chunks").fetchone()[0]
+            vectors = database.execute("SELECT COUNT(*) FROM library_chunk_vectors").fetchone()[0]
+        versions = ["fastapi", "uvicorn", "httpx", "qdrant-client"]
+        if args.vector_backend == "milvus":
+            versions.append("pymilvus")
         report = {
             "label": args.label, "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "platform": platform.platform(), "python": platform.python_version(),
             "logical_cpus": os.cpu_count(), "cpu": os.environ.get("PROCESSOR_IDENTIFIER"),
-            "versions": {name: importlib.metadata.version(name) for name in ("fastapi", "uvicorn", "httpx", "qdrant-client")},
+            "versions": {name: importlib.metadata.version(name) for name in versions},
+            "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "retrieval_status": storage,
+            "scope": "rag_only" if args.rag_only else "all",
             "method": "closed-loop loopback HTTP, client and server on same host/process, no external API; each scenario starts after previous drains",
-            "fixture": {"documents": 30, "sessions": 32, "event_replay_rows": 240,
+            "fixture": {"documents": 30, "chunks": chunks, "indexed_vectors": vectors,
+                        "sessions": 32, "event_replay_rows": 0 if args.rag_only else 240,
                         "chat_delay_ms": 50, "embedding_delay_ms": 10, "rerank_delay_ms": 10,
-                        "vector_dimensions": 64, "quality_evaluation": False},
+                        "vector_dimensions": args.dimensions, "quality_evaluation": False},
             "provider_requests": dict(Provider.counts), "results": results,
         }
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -312,6 +348,15 @@ def main():
         provider.server_close()
         if thread.is_alive():
             raise RuntimeError("Benchmark server did not shut down")
+        index = app.state.retrieval.vectors
+        if args.vector_backend == "milvus" and index is not None and index.created:
+            from pymilvus import MilvusClient
+
+            client = MilvusClient(uri=config.milvus_uri)
+            try:
+                client.drop_collection(collection_name=index.COLLECTION)
+            finally:
+                client.close()
 
 
 if __name__ == "__main__":

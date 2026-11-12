@@ -13,8 +13,10 @@ from ..core.hooks import HookRegistry
 from ..core.state import BackgroundState, CoordinationState
 from ..infrastructure.mcp import MCPService
 from ..infrastructure.model import ModelGateway
+from ..services.arxiv import import_arxiv_pdf
 from ..services.background import BackgroundTasks
 from ..services.context import ContextService
+from ..services.library import LibraryService
 from ..services.library_rag import LIBRARY_TOOL_NAMES, LibraryRAG, library_options
 from ..services.memory import MemoryStore
 from ..services.permissions import PermissionPolicy
@@ -41,6 +43,7 @@ class AgentRuntime:
         emit=discard_event,
         memory_lock=None,
         retrieval=None,
+        library=None,
         personalized=True,
         temporary=False,
     ):
@@ -61,7 +64,11 @@ class AgentRuntime:
         self.workspace = WorkspaceTools(config.workdir, memory_allowed=self._memory_allowed)
         self.tasks = TaskService(config, self.state_dir, self.coordination, background_state)
         self.context = ContextService(config, self.state_dir, self.memory, self.gateway)
-        self.mcp = MCPService()
+        self.library = library
+        self.mcp = MCPService(
+            arxiv_storage=config.data_dir / "library" / "mcp-arxiv",
+            import_pdf=self._import_arxiv_pdf,
+        )
         self.mcp.mcp_tool_policies = {}
         self.hooks = HookRegistry()
         self.permissions = PermissionPolicy(
@@ -103,6 +110,12 @@ class AgentRuntime:
         self._unacknowledged_jobs = []
         self._rounds_without_todo = 0
         self.hooks.register("PostToolUse", self._track_todo_updates)
+
+    def _import_arxiv_pdf(self, paper_id):
+        if self.library is None:
+            self.library = LibraryService(self.config.data_dir / "library")
+        record = import_arxiv_pdf(self.library, paper_id)
+        return f"Imported {record['name']} into the file library (document ID: {record['id']})."
 
     def set_memory_options(self, *, personalized, temporary):
         self._memory_options = personalized, temporary
