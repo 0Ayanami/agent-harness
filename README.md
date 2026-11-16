@@ -1,19 +1,14 @@
 # Agent Harness 应用
-
-这是从教学工程中独立出来的 agent 应用。本仓库根目录就是应用目录，Python 包名为 `agent_harness`；原教学工程的 `s01_*` 到 `s17_*`、`agents/` 和 `web/` 不在当前仓库中。
-
-本版把已有能力组织为组合式运行时，网页从原有 `web/` 的 Next.js 工程迁移，沿用原站的布局、主题、多语言和消息组件，并接入实际 Agent。主循环、子 Agent、记忆、任务、团队、上下文压缩、后台任务和 cron 沿用现有项目的算法。资料库提供文件管理、自动入库、关键词与向量召回、混合检索、模型重排，以及可定位到原文的 Agent 问答。普通对话可通过 Docker MCP 查询 arXiv 论文。
-
 ## 启动网页
 
 从当前仓库根目录执行。已有 `.venv` 时可以直接激活；首次搭建且没有虚拟环境时，先执行 `uv venv --python 3.13 .venv`。依赖要求 Python 3.11 及以上，当前前端要求 Node.js 20.9.0 及以上。
 
 ```powershell
-Set-Location D:\research\agent-harness
-. .\.venv\Scripts\Activate.ps1
-uv sync --frozen --extra milvus --extra redis
-.\scripts\project.ps1 deps
-.\scripts\project.ps1 build
+Set-Location 'D:\research\agent-harness'
+
+docker compose -f deployment/milvus/compose.yaml up -d --wait
+docker compose -f deployment/pdf-layout/compose.yaml up -d --no-build --wait
+
 .\scripts\project.ps1 run
 ```
 

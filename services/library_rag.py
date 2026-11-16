@@ -198,7 +198,7 @@ class LibraryRAG:
         self.identifiers[key] = identifier
         return source
 
-    def _event(self, query):
+    def _event(self, query, **diagnostics):
         self.emit(
             "library_retrieval",
             {
@@ -208,6 +208,7 @@ class LibraryRAG:
                 "reranked": self.reranked,
                 "warning": "\n".join(self.warnings) or None,
                 "sources": list(self.sources.values()),
+                **diagnostics,
             },
         )
 
@@ -241,7 +242,9 @@ class LibraryRAG:
             source = self._remember(hit)
             if source is not None:
                 found.append(source)
-        self._event(query)
+        self._event(query, **{
+            key: result[key] for key in ("timings_ms", "rerank_candidates") if key in result
+        })
         return found
 
     def search_tool(

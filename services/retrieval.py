@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import threading
+from time import perf_counter
 from uuid import uuid4
 
 from ..infrastructure.embeddings import BailianEmbeddings, EmbeddingError
@@ -697,23 +698,29 @@ class RetrievalService:
         if document_ids == []:
             return {"mode": mode, "hits": [], "warning": None, "reranked": False}
 
+        started = perf_counter()
+        timings = {}
         rerank_depth = self.config.rerank_candidates if self.reranker is not None else 0
         result_depth = max(limit, rerank_depth)
         recall_depth = result_depth if mode == "keyword" else max(20, limit * 3, result_depth)
         warnings = []
         lexical, semantic = [], []
         if mode != "vector":
+            stage = perf_counter()
             lexical = self.ingestion.search(
                 keyword_query.strip() if keyword_query is not None else query,
                 document_ids=document_ids,
                 favorites_only=favorites_only,
                 limit=recall_depth,
             )["hits"]
+            timings["keyword"] = round((perf_counter() - stage) * 1000, 2)
         if mode != "keyword":
+            stage = perf_counter()
             semantic, warning = self._semantic_search(
                 vector_query.strip() if vector_query is not None else query,
                 document_ids, favorites_only, recall_depth,
             )
+            timings["semantic"] = round((perf_counter() - stage) * 1000, 2)
             if warning:
                 warnings.append(f"{warning}.")
                 if mode == "hybrid" and not semantic:
@@ -726,6 +733,7 @@ class RetrievalService:
         hits = self._current_hits(hits, document_ids, favorites_only)[:result_depth]
         candidates = hits[:rerank_depth]
         if self.reranker is not None and len(candidates) >= 2:
+            stage = perf_counter()
             try:
                 scores = self.reranker.rerank(query, [hit["text"] for hit in candidates])
                 hits = [
@@ -733,13 +741,17 @@ class RetrievalService:
                 ] + hits[rerank_depth:]
             except RerankError as error:
                 warnings.append(f"{error}. Initial ranking is shown.")
+            timings["rerank"] = round((perf_counter() - stage) * 1000, 2)
             # A mutation can race the provider call. Never return a stale or out-of-scope passage.
             hits = self._current_hits(hits, document_ids, favorites_only)
 
         hits = hits[:limit]
+        timings["total"] = round((perf_counter() - started) * 1000, 2)
         return {
             "mode": mode,
             "hits": hits,
             "warning": " ".join(warnings) or None,
             "reranked": any("rerank_score" in hit for hit in hits),
+            "timings_ms": timings,
+            "rerank_candidates": len(candidates),
         }

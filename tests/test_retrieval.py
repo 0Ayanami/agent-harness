@@ -112,6 +112,44 @@ def test_dashscope_rerank_rejects_untrusted_results(tmp_path, status, body, diag
         assert "rank-test-secret" not in str(failure.value)
 
 
+def test_rerank_recovers_from_one_connection_timeout(tmp_path):
+    requests = []
+
+    def send(request):
+        requests.append(request.content)
+        if len(requests) == 1:
+            raise httpx.ConnectTimeout("connection diagnostic", request=request)
+        return httpx.Response(200, json={"output": {"results": [
+            {"index": 0, "relevance_score": 0.2}, {"index": 1, "relevance_score": 0.9},
+        ]}})
+
+    with httpx.Client(transport=httpx.MockTransport(send)) as client:
+        reranker = BailianReranker(rerank_config(embedding_config(tmp_path)), client=client)
+        assert reranker.rerank("filter", ["alpha", "bravo"]) == [(1, 0.9), (0, 0.2)]
+    assert len(requests) == 2 and requests[0] == requests[1]
+
+
+@pytest.mark.parametrize("error_type, attempts, diagnostic", [
+    (httpx.ConnectTimeout, 2, "connection timed out after 2 attempts"),
+    (httpx.ConnectError, 2, "connection failed after 2 attempts"),
+    (httpx.ReadTimeout, 1, "response timed out"),
+    (httpx.PoolTimeout, 1, "no available connection"),
+])
+def test_rerank_reports_safe_errors_and_bounds_retries(tmp_path, error_type, attempts, diagnostic):
+    calls = 0
+
+    def send(request):
+        nonlocal calls
+        calls += 1
+        raise error_type("rank-test-secret", request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(send)) as client:
+        reranker = BailianReranker(rerank_config(embedding_config(tmp_path)), client=client)
+        with pytest.raises(RerankError, match=diagnostic) as failure:
+            reranker.rerank("filter", ["alpha", "bravo"])
+    assert calls == attempts and "rank-test-secret" not in str(failure.value)
+
+
 def test_embedding_http_batches_and_restores_response_order(tmp_path):
     config = embedding_config(tmp_path)
     calls, delays = [], []
@@ -250,7 +288,10 @@ def test_real_qdrant_hybrid_lookup_fusion_scope_and_reopen(library_components):
         for document in (primary, other):
             assert wait_vector(library, document["id"])["chunk_count"] == 1
         keyword = retrieval.search("spacecraft", mode="keyword")
-        assert keyword == {"mode": "keyword", "hits": [], "warning": None, "reranked": False}
+        expected = {"mode": "keyword", "hits": [], "warning": None, "reranked": False}
+        assert {key: keyword[key] for key in expected} == expected
+        assert keyword["rerank_candidates"] == 0
+        assert set(keyword["timings_ms"]) == {"keyword", "total"}
         assert provider.query_calls == []
         hybrid = retrieval.search("spacecraft", limit=1)
         assert hybrid["mode"] == "hybrid" and hybrid["warning"] is None
@@ -379,7 +420,10 @@ def test_model_reranks_before_top_k_in_each_scoped_retrieval_mode(library_compon
 
         fail = True
         fallback = retrieval.search("shuttle", favorites_only=True, mode="keyword", limit=3)
-        assert not fallback["reranked"] and "Initial ranking is shown" in fallback["warning"]
+        assert not fallback["reranked"] and "response timed out" in fallback["warning"]
+        assert "Initial ranking is shown" in fallback["warning"]
+        assert fallback["rerank_candidates"] == 2
+        assert fallback["timings_ms"]["total"] >= fallback["timings_ms"]["rerank"] >= 0
         assert "rank-test-secret" not in fallback["warning"]
         coarse = ingestion.search("shuttle", favorites_only=True, limit=3)["hits"]
         assert [hit["chunk_id"] for hit in fallback["hits"]] == [hit["chunk_id"] for hit in coarse]

@@ -64,6 +64,7 @@ class HarnessConfig:
     rerank_base_url: str | None = None
     rerank_model: str = "qwen3-rerank"
     rerank_candidates: int = 20
+    rerank_read_timeout: float = 8.0
     vector_backend: str = "qdrant"
     milvus_uri: str = "http://127.0.0.1:19530"
     milvus_token: str | None = field(default=None, repr=False)
@@ -81,6 +82,8 @@ class HarnessConfig:
             raise ValueError("EMBEDDING_MODEL must not be empty")
         if not 2 <= self.rerank_candidates <= 50:
             raise ValueError("RERANK_CANDIDATES must be between 2 and 50")
+        if not 1 <= self.rerank_read_timeout <= 30:
+            raise ValueError("RERANK_READ_TIMEOUT must be between 1 and 30 seconds")
         if not self.rerank_model.strip():
             raise ValueError("RERANK_MODEL must not be empty")
         _validate_service_url(self.embedding_base_url, "EMBEDDING_BASE_URL")
@@ -149,6 +152,7 @@ class HarnessConfig:
             rerank_base_url=rerank_url,
             rerank_model=os.getenv("RERANK_MODEL") or "qwen3-rerank",
             rerank_candidates=int(os.getenv("RERANK_CANDIDATES") or "20"),
+            rerank_read_timeout=float(os.getenv("RERANK_READ_TIMEOUT") or "8"),
             vector_backend=os.getenv("VECTOR_BACKEND") or "qdrant",
             milvus_uri=os.getenv("MILVUS_URI") or "http://127.0.0.1:19530",
             milvus_token=os.getenv("MILVUS_TOKEN") or None,
