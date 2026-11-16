@@ -70,7 +70,8 @@ def require_local_client(request: Request, x_agent_client: str = Header(default=
 def create_app(config, client_factory, *, frontend_origins=(), frontend_directory=None):
     library = LibraryService(config.data_dir / "library")
     ingestion = IngestionService(
-        library, cache_dir=config.workdir / ".artifacts" / "cache" / "jieba"
+        library, cache_dir=config.workdir / ".artifacts" / "cache" / "jieba",
+        pdf_layout_url=config.pdf_layout_url,
     )
     retrieval = RetrievalService(config, library, ingestion)
     application = SessionService(

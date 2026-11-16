@@ -71,6 +71,7 @@ class HarnessConfig:
     redis_url: str | None = field(default=None, repr=False)
     redis_prefix: str = "ayanami"
     redis_cache_ttl: int = 300
+    pdf_layout_url: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "workdir", Path(self.workdir).resolve())
@@ -84,6 +85,12 @@ class HarnessConfig:
             raise ValueError("RERANK_MODEL must not be empty")
         _validate_service_url(self.embedding_base_url, "EMBEDDING_BASE_URL")
         _validate_service_url(self.rerank_base_url, "RERANK_BASE_URL")
+        if self.pdf_layout_url:
+            address = urlsplit(self.pdf_layout_url)
+            if (address.scheme != "http" or address.hostname not in ("127.0.0.1", "localhost", "::1")
+                    or address.username or address.password or address.query or address.fragment
+                    or address.path not in ("", "/")):
+                raise ValueError("PDF_LAYOUT_URL must be a local HTTP base URL")
         if self.vector_backend not in ("qdrant", "milvus"):
             raise ValueError("VECTOR_BACKEND must be qdrant or milvus")
         address = urlsplit(self.milvus_uri)
@@ -149,6 +156,7 @@ class HarnessConfig:
             redis_url=os.getenv("REDIS_URL") or None,
             redis_prefix=os.getenv("REDIS_PREFIX") or "ayanami",
             redis_cache_ttl=int(os.getenv("REDIS_CACHE_TTL") or "300"),
+            pdf_layout_url=os.getenv("PDF_LAYOUT_URL") or None,
         )
 
 

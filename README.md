@@ -77,7 +77,7 @@ python -m agent_harness
 
 向量化会发送文本块或查询，重排会发送本次问题与候选段落，聊天服务只接收本轮回答所需证据。原件、SQLite及旧Qdrant目录位于 `.runtime/agent-harness/library/`，Docker Milvus数据位于 `.runtime/agent-harness/milvus/`。资料库问答按轮次隔离证据，追问时请在本轮写明所指内容。 [资料库阶段总结](docs/library-stage-summary.zh-CN.md) · [CRUD 与 RAG 面试手册](interview/crud-rag-interview-guide.md)
 
-文档按 **Document → Section → Chunk → Vector** 持久化管理。Markdown保留标题树，TXT使用文档根节点，PDF按页建立Section，Chunk关联Section，Vector映射记录chunk、模型、维度与后端。`GET /api/agent/library/files/{id}/structure` 返回当前版本的树和向量映射。OCR、图片和表格专门识别尚待接入，当前保留内容类型、位置和提取元数据。
+文档按 **Document → Section → Chunk → Vector** 持久化管理。Markdown 保留标题树，TXT 使用文档根节点，PDF 按页建立 Section。启用 PDF 版面服务后，会清除重复页眉页脚，把已识别表格作为页面下的独立 Section，按行分块并保留列名和位置。`GET /api/agent/library/files/{id}/structure` 返回当前版本的树和向量映射。 [PDF 版面解析部署与重建索引](deployment/pdf-layout/README.md)
 
 首次使用Milvus，在Docker Desktop运行后逐行执行：
 
@@ -248,6 +248,8 @@ docker pull mcp/wikipedia-mcp
 试用提示词 `把 arXiv 1706.03762v7 的原始 PDF 导入资料库`。确认工具请求后，`mcp__arxiv__import_pdf` 从 arXiv 获取原始 PDF，复用上传校验、去重、存储和索引队列。导入的论文可在资料库预览、下载和检索，原件与网页上传文件一起存入 `.runtime/agent-harness/library/originals/<文件ID>/<版本ID>/source.pdf`。
 
 镜像自带的 `download_paper` 用于转换论文为 Markdown，转换缓存保存在容器 `/app/papers` 对应的 `.runtime/agent-harness/library/mcp-arxiv/`。Wikipedia 工具不需要挂载目录。 [arXiv 镜像](https://hub.docker.com/mcp/server/arxiv-mcp-server/overview) · [Wikipedia 镜像](https://hub.docker.com/mcp/server/wikipedia-mcp/overview)
+
+MCP 工具进入同一个 `PreToolUse` 权限 Hook。Wikipedia 已知的搜索、摘要、正文等只读工具直接执行。arXiv 的 `import_pdf` 与 `download_paper` 会在下载前请求审批。镜像更新后发现的新工具默认请求审批，权限以项目内策略为准。 [工具策略](infrastructure/mcp.py)
 
 ## 扩展方式
 

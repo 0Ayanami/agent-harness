@@ -673,12 +673,21 @@ class RetrievalService:
         identifiers = sorted(by_id, key=lambda identifier: (-scores[identifier], identifier))
         return [{**by_id[identifier], "score": scores[identifier]} for identifier in identifiers]
 
-    def search(self, query, *, document_ids=None, favorites_only=False, limit=10, mode="hybrid"):
+    def search(
+        self, query, *, document_ids=None, favorites_only=False, limit=10,
+        mode="hybrid", keyword_query=None, vector_query=None,
+    ):
         query = query.strip()
         if not query or len(query) > 2000 or not 1 <= limit <= 50:
             raise LibraryError(422, "Provide a query and a result limit between 1 and 50")
         if mode not in ("keyword", "vector", "hybrid"):
             raise LibraryError(422, "Search mode must be keyword, vector or hybrid")
+        for branch_query in (keyword_query, vector_query):
+            if branch_query is not None and (
+                mode != "hybrid" or not isinstance(branch_query, str)
+                or not branch_query.strip() or len(branch_query) > 2000
+            ):
+                raise LibraryError(422, "Branch queries require hybrid mode and 1 to 2000 characters")
         if document_ids is not None and (
             not isinstance(document_ids, list)
             or len(document_ids) > 100
@@ -695,14 +704,15 @@ class RetrievalService:
         lexical, semantic = [], []
         if mode != "vector":
             lexical = self.ingestion.search(
-                query,
+                keyword_query.strip() if keyword_query is not None else query,
                 document_ids=document_ids,
                 favorites_only=favorites_only,
                 limit=recall_depth,
             )["hits"]
         if mode != "keyword":
             semantic, warning = self._semantic_search(
-                query, document_ids, favorites_only, recall_depth
+                vector_query.strip() if vector_query is not None else query,
+                document_ids, favorites_only, recall_depth,
             )
             if warning:
                 warnings.append(f"{warning}.")

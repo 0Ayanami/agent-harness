@@ -12,9 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 class IngestionService:
-    def __init__(self, library, *, cache_dir):
+    def __init__(self, library, *, cache_dir, pdf_layout_url=None):
         self.library = library
-        self.parser = DocumentParser()
+        self.parser = DocumentParser(pdf_layout_url=pdf_layout_url)
         self.index = LibraryIndexRepository(library.repository, KeywordTokenizer(cache_dir))
         self.lexical = ApplicationBM25Index(self.index)
         self.shutdown = threading.Event()

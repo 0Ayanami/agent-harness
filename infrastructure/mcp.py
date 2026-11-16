@@ -64,6 +64,8 @@ class MCPService:
             ("docs", "get_version"): "allow",
             ("deploy", "status"): "allow",
             ("deploy", "trigger"): "confirm",
+            ("arxiv", "import_pdf"): "confirm",
+            ("arxiv", "download_paper"): "confirm",
         }
         self.MCP_HOST_POLICY.update(
             {("arxiv", name): "allow" for name in ("search_papers", "list_papers", "read_paper")}

@@ -388,6 +388,27 @@ def test_model_reranks_before_top_k_in_each_scoped_retrieval_mode(library_compon
         assert len(bounded["hits"]) == 3
         assert [hit.get("rerank_score") for hit in bounded["hits"]] == [0.9, 0.1, None]
 
+        lexical_search, semantic_search = ingestion.search, retrieval._semantic_search
+        branch_calls = []
+
+        def capture_lexical(query, **kwargs):
+            branch_calls.append(("keyword", query))
+            return lexical_search(query, **kwargs)
+
+        def capture_semantic(query, *args):
+            branch_calls.append(("vector", query))
+            return semantic_search(query, *args)
+
+        monkeypatch.setattr(ingestion, "search", capture_lexical)
+        monkeypatch.setattr(retrieval, "_semantic_search", capture_semantic)
+        result = retrieval.search(
+            "How is the shuttle maintained?", keyword_query="shuttle",
+            vector_query="orbital vehicle servicing", favorites_only=True, limit=1,
+        )
+        assert branch_calls == [("keyword", "shuttle"), ("vector", "orbital vehicle servicing")]
+        assert result["mode"] == "hybrid" and result["reranked"]
+        assert result["hits"][0]["document_id"] in permitted
+
         def fail_if_lexical(*args, **kwargs):
             raise AssertionError("Vector mode must not run BM25")
 

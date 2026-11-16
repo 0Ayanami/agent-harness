@@ -21,13 +21,14 @@ class KeywordRetrieval:
         self.ingestion = ingestion
         self.calls = []
 
-    def search(self, query, *, document_ids=None, favorites_only=False, limit=10, mode="hybrid"):
+    def search(self, query, *, document_ids=None, favorites_only=False, limit=10, mode="hybrid", **branch_queries):
         self.calls.append(
             {
                 "query": query,
                 "document_ids": document_ids,
                 "favorites_only": favorites_only,
                 "mode": mode,
+                **branch_queries,
             }
         )
         return self.ingestion.search(
@@ -103,6 +104,29 @@ def test_initial_retrieval_reaches_model_before_any_tool_and_citations_persist(r
     assert events(rag, "assistant")[-1]["run_id"] == answer["run_id"]
     assert events(rag, "library_retrieval")[0]["sources"][0]["text"] == source["text"]
     assert not application.get(rag[-1]).runtime.rag.active
+
+
+def test_agent_can_choose_search_mode_and_separate_queries_within_scope(rag):
+    _, model, retrieval, _, first, second, _ = rag
+    question = "白鹭协议怎样恢复？"
+    model.replies = [
+        response(
+            tool("search_library", {"mode": "vector", "query": "恢复流程"}, "vector"),
+            tool("search_library", {
+                "mode": "hybrid", "keyword_query": "白鹭", "vector_query": "恢复流程",
+                "document_ids": [first["id"], second["id"]],
+            }, "hybrid"),
+            stop_reason="tool_use",
+        ),
+        response(text("先检查检查点。[S1]")),
+    ]
+    ask(rag, question, [first["id"]])
+    initial, vector, hybrid = retrieval.calls
+    assert (initial["mode"], vector["mode"], hybrid["mode"]) == ("keyword", "vector", "hybrid")
+    assert vector["query"] == "恢复流程"
+    assert hybrid["query"] == question
+    assert (hybrid["keyword_query"], hybrid["vector_query"]) == ("白鹭", "恢复流程")
+    assert hybrid["document_ids"] == [first["id"]]
 
 
 def test_real_read_tool_uses_dispatcher_and_matching_tool_result(rag):

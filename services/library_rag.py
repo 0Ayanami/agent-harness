@@ -11,15 +11,24 @@ LIBRARY_TOOL_NAMES = {"search_library", "read_library_document"}
 LIBRARY_TOOLS = [
     {
         "name": "search_library",
-        "description": "Search the current library scope for supporting passages. Returns real source IDs such as S1; never searches outside the user-selected documents or favorites.",
+        "description": (
+            "Search the current library scope for supporting passages. Use keyword for exact terms, "
+            "vector for semantic similarity, or hybrid to fuse both. If mode is omitted, use the turn's "
+            "configured mode. For hybrid, optionally provide separate keyword_query and vector_query; "
+            "query supplies any missing branch and is used for reranking. With both branch queries, "
+            "query may be omitted to rerank against the original user question. Returns source IDs such "
+            "as S1 within the user-selected documents or favorites."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "mode": {"type": "string", "enum": ["keyword", "vector", "hybrid"]},
+                "keyword_query": {"type": "string", "minLength": 1, "maxLength": 2000},
+                "vector_query": {"type": "string", "minLength": 1, "maxLength": 2000},
                 "document_ids": {"type": "array", "items": {"type": "string"}, "maxItems": 100},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 8},
             },
-            "required": ["query"],
             "additionalProperties": False,
         },
     },
@@ -82,6 +91,7 @@ class LibraryRAG:
         self.active = False
         self.options = None
         self.run_id = None
+        self.original_query = ""
         self.sources = {}
         self.identifiers = {}
         self.warnings = []
@@ -107,7 +117,8 @@ class LibraryRAG:
         self.reranked = False
         if len(query) > 2000:
             self._warn("问题较长，本轮初次检索使用前 2000 个字符；可通过补充搜索缩小范围。")
-        self._search(query[:2000], self.options["document_ids"], 8)
+        self.original_query = query[:2000]
+        self._search(self.original_query, self.options["document_ids"], 8)
         return bool(self.sources)
 
     def end(self):
@@ -200,22 +211,24 @@ class LibraryRAG:
             },
         )
 
-    def _search(self, query, document_ids, limit):
+    def _search(self, query, document_ids, limit, *, mode=None, **branch_queries):
         self._check_cancelled()
+        mode = self.options["mode"] if mode is None else mode
         try:
             result = self.retrieval.search(
                 query,
                 document_ids=document_ids,
                 favorites_only=self.options["favorites_only"],
                 limit=limit,
-                mode=self.options["mode"],
+                mode=mode,
+                **branch_queries,
             )
         except InterruptedError:
             raise
         except Exception:
             # Never persist arbitrary provider exception bodies or credentials.
             result = {
-                "mode": self.options["mode"],
+                "mode": mode,
                 "hits": [],
                 "warning": "资料检索暂不可用，请检查检索服务后重试。",
             }
@@ -231,9 +244,24 @@ class LibraryRAG:
         self._event(query)
         return found
 
-    def search_tool(self, query, document_ids=None, limit=5):
+    def search_tool(
+        self, query=None, document_ids=None, limit=5, *,
+        mode=None, keyword_query=None, vector_query=None,
+    ):
         if not self.active:
             return json.dumps({"error": "Library mode is not active"})
+        mode = self.options["mode"] if mode is None else mode
+        if mode not in ("keyword", "vector", "hybrid"):
+            return json.dumps({"error": "Search mode must be keyword, vector or hybrid"})
+        branches = {}
+        for name, value in (("keyword_query", keyword_query), ("vector_query", vector_query)):
+            if value is None:
+                continue
+            if mode != "hybrid" or not isinstance(value, str) or not value.strip() or len(value) > 2000:
+                return json.dumps({"error": f"{name} requires hybrid mode and 1 to 2000 characters"})
+            branches[name] = value.strip()
+        if query is None and len(branches) == 2:
+            query = self.original_query
         if not isinstance(query, str) or not query.strip() or len(query) > 2000:
             return json.dumps({"error": "Provide a nonempty query of at most 2000 characters"})
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 8:
@@ -251,7 +279,7 @@ class LibraryRAG:
             narrowed = list(dict.fromkeys(document_ids))
         else:
             narrowed = [item for item in document_ids if item in scope]
-        found = self._search(query.strip(), narrowed, limit)
+        found = self._search(query.strip(), narrowed, limit, mode=mode, **branches)
         return json.dumps(
             {
                 "mode": self.mode,
