@@ -43,10 +43,49 @@ def test_markdown_sections_form_real_tree_and_ignore_fenced_code(tmp_path):
     assert [section["ordinal"] for section in sections] == list(range(5))
     keys = {section["key"] for section in sections}
     assert all(chunk["section_key"] in keys for chunk in document["chunks"])
-    assert all(chunk["content_type"] == "text" for chunk in document["chunks"])
+    assert [chunk["text"] for chunk in document["chunks"] if chunk["content_type"] == "code"] == [
+        "```python\n# This is code\n## Still code\n```", "~~~text\n# Also code\n~~~",
+    ]
     compatible = parser.parse(path, "md")
     assert isinstance(compatible, list) and compatible == document["chunks"]
     assert compatible.sections == sections
+
+
+def test_markdown_chunks_keep_structure_and_exact_source_lines(tmp_path):
+    path = tmp_path / "structures.md"
+    body = (
+        "# Reference\n" + "Context line.\n" * 120
+        + "\nName | Value\n:--- | ---:\nSaturn \\| rings | 95\n"
+        + "\n~~~~python\n    print('literal')\n~~~\n# still code\n~~~~\n"
+        + "\n## Next\noutside prose\n"
+    )
+    path.write_text(body, encoding="utf-8")
+    parsed = DocumentParser().parse_document(path, "md")
+    original_lines = body.splitlines()
+    table, code = [chunk for chunk in parsed["chunks"] if chunk["content_type"] != "text"]
+    assert table["text"] == "Name | Value\n:--- | ---:\nSaturn \\| rings | 95"
+    assert code["text"] == "~~~~python\n    print('literal')\n~~~\n# still code\n~~~~"
+    for chunk in (table, code):
+        location = chunk["location"]
+        assert chunk["text"] == "\n".join(original_lines[location["start_line"] - 1:location["end_line"]])
+        assert location["heading_path"] == ["Reference"]
+    assert parsed["chunks"][-1]["location"]["heading_path"] == ["Reference", "Next"]
+
+
+def test_oversize_markdown_blocks_prefer_whole_lines(tmp_path):
+    path = tmp_path / "large.md"
+    rows = [f"Key{i} | " + "value " * 14 for i in range(33)]
+    code = ["    " + "x" * 74 for _ in range(22)] + ["y" * 1300]
+    path.write_text("Name | Value\n--- | ---\n" + "\n".join(rows)
+                    + "\n\n```text\n" + "\n".join(code) + "\n```\n", encoding="utf-8")
+    parts = DocumentParser().parse(path, "md")
+    assert all(len(part["text"]) <= 1200 for part in parts)
+    tables = [part for part in parts if part["content_type"] == "table"]
+    codes = [part for part in parts if part["content_type"] == "code"]
+    assert len(tables) > 1 and len(codes) > 1
+    assert all(sum(row in part["text"].splitlines() for part in tables) == 1 for row in rows)
+    assert sum(part["text"].count("y") for part in codes) == 1300
+    assert len({part["location"]["block_start_line"] for part in codes}) == 1
 
 
 def test_plain_text_root_and_pdf_page_sections_keep_source_locations(tmp_path):
@@ -174,7 +213,7 @@ def test_structure_http_exposes_current_layers_without_embedding_and_delete_is_4
     with TestClient(app) as browser:
         response = browser.post(
             "/api/agent/library/files", headers=headers,
-            files={"file": ("outline.md", b"# Parent\nbody\n## Child\nleaf")},
+            files={"file": ("outline.md", b"# Parent\nbody\n\nName | Value\n--- | ---\nSaturn | 95\n\n## Child\nleaf\n```py\n    run_probe()\n```\n")},
         )
         assert response.status_code == 201
         document = response.json()
@@ -183,11 +222,16 @@ def test_structure_http_exposes_current_layers_without_embedding_and_delete_is_4
         assert response.status_code == 200
         result = response.json()
         assert result["document_id"] == document["id"] and result["version_id"] == document["version_id"]
-        assert result["section_count"] == 3 and result["chunk_count"] == 2
+        assert result["section_count"] == 3 and result["chunk_count"] == 4
         assert result["vector_count"] == 0
         chunks = [chunk for section in flatten(result["sections"]) for chunk in section["chunks"]]
-        assert len(chunks) == 2 and all(chunk["vectors"] == [] for chunk in chunks)
-        assert all(chunk["section_id"] and chunk["content_type"] == "text" for chunk in chunks)
+        assert [chunk["content_type"] for chunk in chunks] == ["text", "table", "text", "code"]
+        assert all(chunk["section_id"] and chunk["vectors"] == [] for chunk in chunks)
+        for query, kind, excerpt in (("Saturn", "table", "Saturn | 95"), ("run_probe", "code", "    run_probe()")):
+            hits = browser.post("/api/agent/library/search", headers=headers,
+                                json={"query": query, "mode": "keyword"}).json()["hits"]
+            assert hits[0]["content_type"] == kind
+            assert excerpt in hits[0]["text"]
         assert browser.get(f"/api/library/files/{document['id']}/structure").json() == result
         assert browser.delete(f"/api/library/files/{document['id']}", headers=headers).status_code == 204
         assert browser.get(f"/api/agent/library/files/{document['id']}/structure").status_code == 404

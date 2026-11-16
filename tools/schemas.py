@@ -278,7 +278,7 @@ BUILTIN_SCHEMAS = [
     {
         "name": "connect_mcp",
         "description": "Discover tools from arxiv (paper search, Markdown reading and original PDF "
-        "import into the local file library) or wikipedia (article search and reading). "
+        "import into the local file library). "
         "The docs and deploy servers are local demos.",
         "input_schema": {
             "type": "object",

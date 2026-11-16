@@ -2,7 +2,7 @@
 
 这是从教学工程中独立出来的 agent 应用。本仓库根目录就是应用目录，Python 包名为 `agent_harness`；原教学工程的 `s01_*` 到 `s17_*`、`agents/` 和 `web/` 不在当前仓库中。
 
-本版把已有能力组织为组合式运行时，网页从原有 `web/` 的 Next.js 工程迁移，沿用原站的布局、主题、多语言和消息组件，并接入实际 Agent。主循环、子 Agent、记忆、任务、团队、上下文压缩、后台任务和 cron 沿用现有项目的算法。资料库提供文件管理、自动入库、关键词与向量召回、混合检索、模型重排，以及可定位到原文的 Agent 问答。普通对话支持 Docker MCP 工具，可查询 arXiv 和 Wikipedia。
+本版把已有能力组织为组合式运行时，网页从原有 `web/` 的 Next.js 工程迁移，沿用原站的布局、主题、多语言和消息组件，并接入实际 Agent。主循环、子 Agent、记忆、任务、团队、上下文压缩、后台任务和 cron 沿用现有项目的算法。资料库提供文件管理、自动入库、关键词与向量召回、混合检索、模型重排，以及可定位到原文的 Agent 问答。普通对话可通过 Docker MCP 查询 arXiv 论文。
 
 ## 启动网页
 
@@ -78,6 +78,8 @@ python -m agent_harness
 向量化会发送文本块或查询，重排会发送本次问题与候选段落，聊天服务只接收本轮回答所需证据。原件、SQLite及旧Qdrant目录位于 `.runtime/agent-harness/library/`，Docker Milvus数据位于 `.runtime/agent-harness/milvus/`。资料库问答按轮次隔离证据，追问时请在本轮写明所指内容。 [资料库阶段总结](docs/library-stage-summary.zh-CN.md) · [CRUD 与 RAG 面试手册](interview/crud-rag-interview-guide.md)
 
 文档按 **Document → Section → Chunk → Vector** 持久化管理。Markdown 保留标题树，TXT 使用文档根节点，PDF 按页建立 Section。启用 PDF 版面服务后，会清除重复页眉页脚，把已识别表格作为页面下的独立 Section，按行分块并保留列名和位置。`GET /api/agent/library/files/{id}/structure` 返回当前版本的树和向量映射。 [PDF 版面解析部署与重建索引](deployment/pdf-layout/README.md)
+
+Markdown 先按 `#` 标题建立章节，再在每节内单独切管道表格和围栏代码块。长度在 1,200 字符以内时整块保存，超限时优先沿原表格行或代码行拆分，只有单行超限时才切行内。结构块保留原文、完整块的行号范围及各片段的行号范围。TXT 和 Markdown 普通正文继续使用 1,200 字符、150 字符重叠的窗口。已有 Markdown 可在文件预览中点击「重建索引」应用新规则。 [Markdown 围栏和表格语法](https://github.github.com/gfm/)
 
 首次使用Milvus，在Docker Desktop运行后逐行执行：
 
@@ -236,20 +238,19 @@ HTTP 提交立即返回 `202`，执行进入会话的工作线程。SSE 按事�
 
 默认静态模式只有一个 Python 服务。开发模式额外运行 Next，只允许启动参数指定的 loopback 前端 origin；不允许任意 CORS 或伪造转发头。`/api/agent/*` 与原 `/api/*` 使用同一个路由与权限政策。事件流带有 `no-transform`，避免代理压缩缓冲阻止及时显示工具和审批。重放请求在固定事件上界内读取全部分页，刷新后用持久事件恢复对话。
 
-### arXiv 与 Wikipedia MCP
+### arXiv MCP
 
-启动 Docker Desktop 后，在普通对话中请 Agent 用 `wikipedia` 搜索词条，或用 `arxiv` 搜论文。首次使用时 Agent 调用 `connect_mcp` 发现工具。后端以 stdio 启动本机镜像，工具调用结束后移除容器。若当前 Docker 引擎里缺少镜像，先运行以下命令。
+启动 Docker Desktop 后，在普通对话中请 Agent 用 `arxiv` 搜论文。首次使用时 Agent 调用 `connect_mcp` 发现工具。后端以 stdio 启动本机镜像，工具调用结束后移除容器。若当前 Docker 引擎里缺少镜像，先运行以下命令。
 
 ```powershell
 docker pull mcp/arxiv-mcp-server
-docker pull mcp/wikipedia-mcp
 ```
 
 试用提示词 `把 arXiv 1706.03762v7 的原始 PDF 导入资料库`。确认工具请求后，`mcp__arxiv__import_pdf` 从 arXiv 获取原始 PDF，复用上传校验、去重、存储和索引队列。导入的论文可在资料库预览、下载和检索，原件与网页上传文件一起存入 `.runtime/agent-harness/library/originals/<文件ID>/<版本ID>/source.pdf`。
 
-镜像自带的 `download_paper` 用于转换论文为 Markdown，转换缓存保存在容器 `/app/papers` 对应的 `.runtime/agent-harness/library/mcp-arxiv/`。Wikipedia 工具不需要挂载目录。 [arXiv 镜像](https://hub.docker.com/mcp/server/arxiv-mcp-server/overview) · [Wikipedia 镜像](https://hub.docker.com/mcp/server/wikipedia-mcp/overview)
+镜像自带的 `download_paper` 用于转换论文为 Markdown。转换缓存保存在容器 `/app/papers` 对应的 `.runtime/agent-harness/library/mcp-arxiv/`。Agent 可以通过 `list_papers` 查看已缓存的论文，通过 `read_paper` 读取缓存正文。 [arXiv 镜像](https://hub.docker.com/mcp/server/arxiv-mcp-server/overview)
 
-MCP 工具进入同一个 `PreToolUse` 权限 Hook。Wikipedia 已知的搜索、摘要、正文等只读工具直接执行。arXiv 的 `import_pdf` 与 `download_paper` 会在下载前请求审批。镜像更新后发现的新工具默认请求审批，权限以项目内策略为准。 [工具策略](infrastructure/mcp.py)
+MCP 工具进入 `PreToolUse` 权限 Hook。arXiv 的搜索、列表和阅读工具可直接执行，`import_pdf` 与 `download_paper` 在下载前请求审批。镜像更新后发现的新工具默认请求审批。`docs` 和 `deploy` 是项目内的演示服务。 [工具策略](infrastructure/mcp.py)
 
 ## 扩展方式
 

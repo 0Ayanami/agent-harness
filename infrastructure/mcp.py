@@ -34,22 +34,8 @@ class MCPClient:
 class MCPService:
     DOCKER_IMAGES = {
         "arxiv": "mcp/arxiv-mcp-server",
-        "wikipedia": "mcp/wikipedia-mcp",
     }
-    SERVER_ALIASES = {"arxiv-mcp-server": "arxiv", "wikipedia-mcp": "wikipedia"}
-    WIKIPEDIA_READ_TOOLS = {
-        "extract_key_facts",
-        "get_article",
-        "get_coordinates",
-        "get_links",
-        "get_related_topics",
-        "get_sections",
-        "get_summary",
-        "search_wikipedia",
-        "summarize_article_for_query",
-        "summarize_article_section",
-        "test_wikipedia_connectivity",
-    }
+    SERVER_ALIASES = {"arxiv-mcp-server": "arxiv"}
 
     def __init__(self, *, arxiv_storage=None, import_pdf=None):
         self.arxiv_storage = arxiv_storage
@@ -69,13 +55,6 @@ class MCPService:
         }
         self.MCP_HOST_POLICY.update(
             {("arxiv", name): "allow" for name in ("search_papers", "list_papers", "read_paper")}
-        )
-        self.MCP_HOST_POLICY.update(
-            {
-                ("wikipedia", prefix + name): "allow"
-                for prefix in ("", "wikipedia_")
-                for name in self.WIKIPEDIA_READ_TOOLS
-            }
         )
         self.MOCK_SERVERS = {
             "docs": self._mock_server_docs,

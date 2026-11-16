@@ -14,6 +14,11 @@ import httpx
 from pypdf import PdfReader
 
 
+MARKDOWN_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*)|$)")
+MARKDOWN_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+TABLE_DELIMITER = re.compile(r":?-+:?")
+
+
 class DocumentParseError(ValueError):
     def __init__(self, message, *, needs_ocr=False):
         super().__init__(message)
@@ -101,17 +106,18 @@ class DocumentParser:
         for ordinal, section in enumerate(sections):
             section["ordinal"] = ordinal
             table = section["kind"] == "table"
-            parts = (
-                self._table_chunks(section)
-                if table
-                else self._chunks(section["text"], section["location"])
-            )
+            if table:
+                parts = self._table_chunks(section)
+            elif extension == "md":
+                parts = self._markdown_chunks(section)
+            else:
+                parts = self._chunks(section["text"], section["location"])
             for chunk in parts:
                 chunks.append(
                     {
-                        **chunk,
                         "section_key": section["key"],
                         "content_type": "table" if table else "text",
+                        **chunk,
                         "metadata": {"extraction_method": section["metadata"]["extraction_method"]},
                     }
                 )
@@ -283,22 +289,17 @@ class DocumentParser:
             )
 
         for number, line in enumerate(text.splitlines(keepends=True), 1):
-            marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\n"))
+            marker = MARKDOWN_FENCE.match(line.rstrip("\n"))
             if fence is not None:
                 lines.append(line)
-                if (
-                    marker
-                    and marker[1][0] == fence[0]
-                    and len(marker[1]) >= fence[1]
-                    and not marker[2].strip()
-                ):
+                if self._closes_fence(marker, fence):
                     fence = None
                 continue
-            if marker and (marker[1][0] == "~" or "`" not in marker[2]):
+            if self._opens_fence(marker):
                 fence = (marker[1][0], len(marker[1]))
                 lines.append(line)
                 continue
-            match = re.match(r"^ {0,3}(#{1,6})(?:[ \t]+(.*)|$)", line.rstrip("\n"))
+            match = MARKDOWN_HEADING.match(line.rstrip("\n"))
             if match:
                 finish()
                 level = len(match[1])
@@ -327,6 +328,117 @@ class DocumentParser:
             lines.append(line)
         finish()
         return sections
+
+    @staticmethod
+    def _opens_fence(marker):
+        return marker is not None and (marker[1][0] == "~" or "`" not in marker[2])
+
+    @staticmethod
+    def _closes_fence(marker, fence):
+        return (
+            marker is not None
+            and marker[1][0] == fence[0]
+            and len(marker[1]) >= fence[1]
+            and not marker[2].strip()
+        )
+
+    @staticmethod
+    def _pipe_cells(line):
+        line = line.strip()
+        pipes = [match.start() for match in re.finditer(r"\\.|(\|)", line) if match[1]]
+        if not pipes:
+            return []
+        boundaries = [-1, *pipes, len(line)]
+        return [
+            line[left + 1 : right].strip()
+            for left, right in zip(boundaries, boundaries[1:])
+            if right != 0 and left != len(line) - 1
+        ]
+
+    def _markdown_chunks(self, section):
+        lines = section["text"].splitlines()
+        location = section["location"]
+        cursor = prose_start = 0
+        while cursor < len(lines):
+            kind = None
+            end = cursor + 1
+            marker = MARKDOWN_FENCE.match(lines[cursor])
+            if self._opens_fence(marker):
+                kind = "code"
+                fence = (marker[1][0], len(marker[1]))
+                while end < len(lines):
+                    closing = MARKDOWN_FENCE.match(lines[end])
+                    end += 1
+                    if self._closes_fence(closing, fence):
+                        break
+            elif end < len(lines) and not MARKDOWN_HEADING.match(lines[cursor]):
+                header, delimiters = self._pipe_cells(lines[cursor]), self._pipe_cells(lines[end])
+                if (
+                    header
+                    and len(header) == len(delimiters)
+                    and all(TABLE_DELIMITER.fullmatch(cell) for cell in delimiters)
+                ):
+                    kind = "table"
+                    end += 1
+                    while (
+                        end < len(lines)
+                        and not MARKDOWN_HEADING.match(lines[end])
+                        and not (self._opens_fence(MARKDOWN_FENCE.match(lines[end])))
+                        and self._pipe_cells(lines[end])
+                    ):
+                        end += 1
+            if kind:
+                yield from self._chunks(
+                    "\n".join(lines[prose_start:cursor]),
+                    {
+                        **location,
+                        "start_line": location["start_line"] + prose_start,
+                    },
+                )
+                yield from self._markdown_block_chunks(
+                    lines[cursor:end],
+                    kind,
+                    {
+                        **location,
+                        "start_line": location["start_line"] + cursor,
+                    },
+                )
+                prose_start = end
+            cursor = end
+        yield from self._chunks(
+            "\n".join(lines[prose_start:]),
+            {
+                **location,
+                "start_line": location["start_line"] + prose_start,
+            },
+        )
+
+    def _markdown_block_chunks(self, lines, kind, location):
+        text = "\n".join(lines)
+        start, line = 0, location["start_line"]
+        block_end = line + len(lines) - 1
+        while start < len(text):
+            end = min(start + self.CHUNK_CHARACTERS, len(text))
+            if end < len(text):
+                boundary = text.rfind("\n", start, end + 1)
+                if boundary > start:
+                    end = boundary
+            body = text[start:end]
+            end_line = line + body.count("\n")
+            if body.strip():
+                yield {
+                    "text": body,
+                    "content_type": kind,
+                    "location": {
+                        **location,
+                        "start_line": line,
+                        "end_line": end_line,
+                        "block_start_line": location["start_line"],
+                        "block_end_line": block_end,
+                    },
+                }
+            newline = text[end : end + 1] == "\n"
+            start, line = end + newline, end_line + newline
 
     def _check_page_streams(self, page):
         contents = page.get("/Contents")

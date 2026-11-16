@@ -7,6 +7,7 @@ uniquely named test collections are dropped; no .env or online model is used.
 import io
 import json
 import os
+from threading import Event
 from uuid import uuid4
 
 import httpx
@@ -20,6 +21,7 @@ from agent_harness.infrastructure.library_vectors import VectorIndexError
 from agent_harness.infrastructure.milvus_vectors import MilvusLibraryIndex, vector_identifier
 from agent_harness.services.ingestion import IngestionService
 from agent_harness.services.library import LibraryError, LibraryService
+from agent_harness.services.library_rag import LibraryRAG
 from agent_harness.services.retrieval import RetrievalService
 from test_retrieval import FixedEmbeddings
 from test_services import wait_until
@@ -276,6 +278,18 @@ def test_real_milvus_bm25_rrf_rerank_structure_and_cached_reopen(tmp_path, real_
                 assert {hit["document_id"] for hit in result["hits"]} == {first["id"], second["id"]}
                 assert result["hits"][0]["text"] == sent[-1][-1]
                 assert all(hit["section_id"] and hit["rerank_score"] > 0 for hit in result["hits"])
+            rag = LibraryRAG(retrieval, lambda *_: None, Event())
+            assert rag.begin("orbital", {"enabled": True, "mode": "keyword", "favorites_only": True})
+            for mode in ("keyword", "vector", "hybrid"):
+                before = len(provider.query_calls)
+                arguments = {"query": "orbital"}
+                if mode == "hybrid":
+                    arguments = {"keyword_query": "shuttle", "vector_query": "orbital maintenance"}
+                result = json.loads(rag.search_tool(mode=mode, **arguments))
+                assert result["mode"] == mode and result["reranked"] and result["warning"] is None
+                assert {source["document_id"] for source in result["sources"]} == {first["id"], second["id"]}
+                assert len(provider.query_calls) == before + (mode != "keyword")
+            rag.end()
             original_search = ingestion.search
             monkeypatch.setattr(ingestion, "search", lambda *args, **kwargs: pytest.fail("Strict vector mode called BM25"))
             scoped = retrieval.search("orbital", mode="vector", document_ids=[first["id"]])

@@ -1,7 +1,10 @@
 name: agent-harness-pdf-layout
 services:
   pdf-layout:
-    build: .
+    build:
+      context: .
+      args:
+        PYTHON_BASE_IMAGE: ${PDF_LAYOUT_PYTHON_IMAGE:-python:3.13-slim}
     ports:
       - "127.0.0.1:8079:8079"
     restart: unless-stopped

@@ -12,22 +12,20 @@ from test_library import FILES, PDF, upload
 from test_services import FakeClient, wait_until
 
 
-def test_wikipedia_and_arxiv_use_host_tool_policy(tmp_path, monkeypatch):
+def test_removed_wikipedia_and_arxiv_host_tool_policy(tmp_path, monkeypatch):
     service = MCPService()
-    available = {
-        "wikipedia": ["search_wikipedia", "wikipedia_get_summary", "new_export"],
-        "arxiv": ["search_papers", "download_paper"],
-    }
     monkeypatch.setattr(
         service,
         "_connect_docker",
         lambda name: SimpleNamespace(
             tools=[
-                {"name": tool, "annotations": {"readOnlyHint": True}} for tool in available[name]
+                {"name": tool, "annotations": {"readOnlyHint": True}}
+                for tool in ("search_papers", "download_paper", "new_export")
             ]
         ),
     )
-    assert "Connected" in service.connect_mcp("wikipedia-mcp")
+    assert "Unknown server" in service.connect_mcp("wikipedia-mcp")
+    assert "Unknown server" in service.connect_mcp("wikipedia")
     assert "Connected" in service.connect_mcp("arxiv")
     definitions, _ = service.assemble_tool_pool([], {})
     prompts = []
@@ -35,7 +33,7 @@ def test_wikipedia_and_arxiv_use_host_tool_policy(tmp_path, monkeypatch):
     for definition in definitions:
         result = permissions.check(SimpleNamespace(name=definition["name"], input={}))
         assert bool(result) == definition["name"].endswith(("new_export", "download_paper"))
-    assert set(prompts) == {"mcp__wikipedia__new_export", "mcp__arxiv__download_paper"}
+    assert set(prompts) == {"mcp__arxiv__new_export", "mcp__arxiv__download_paper"}
 
 
 def test_arxiv_tool_imports_into_the_web_library(tmp_path, monkeypatch):
