@@ -13,6 +13,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ...application.sessions import SessionConflict, SessionService
+from ...infrastructure.cron_client import CronUnavailable
 from ...services.ingestion import IngestionService
 from ...services.library import LibraryService
 from ...services.retrieval import RetrievalService
@@ -75,7 +76,8 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
     )
     retrieval = RetrievalService(config, library, ingestion)
     application = SessionService(
-        config, client_factory, retrieval=retrieval, library=library, resume_schedules=True
+        config, client_factory, retrieval=retrieval, library=library,
+        resume_schedules=True, stream_answers=True,
     )
 
     @asynccontextmanager
@@ -105,6 +107,8 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
             raise HTTPException(404, "Session not found") from None
         except SessionConflict as error:
             raise HTTPException(409, str(error)) from error
+        except CronUnavailable:
+            raise HTTPException(503, "Cron service is unavailable") from None
 
     if frontend_directory is None:
 
@@ -137,8 +141,8 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
         return application.create(**(body.model_dump() if body else {}))
 
     @router.get("/sessions/{session_id}")
-    def session_snapshot(session_id: str):
-        return session_operation(application.snapshot, session_id)
+    def session_snapshot(session_id: str, include_history: bool = True):
+        return session_operation(application.snapshot, session_id, include_history=include_history)
 
     @router.patch("/sessions/{session_id}", dependencies=[Depends(require_local_client)])
     def update_session(session_id: str, body: SessionPatch):
@@ -158,7 +162,10 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
 
     @router.get("/scheduled-tasks")
     def list_scheduled_tasks():
-        return application.scheduled_tasks()
+        try:
+            return application.scheduled_tasks()
+        except CronUnavailable:
+            raise HTTPException(503, "Cron service is unavailable") from None
 
     @router.get("/sessions/{session_id}/scheduled-tasks")
     def list_session_scheduled_tasks(session_id: str):
@@ -245,8 +252,9 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
     ):
         cursor = max(after, last_event_id)
         notification_version = application.repository.notification_version(session_id)
+        initial_draft = application.assistant_draft(session_id) if not once else None
         page = await run_in_threadpool(
-            application.repository.event_page, session_id, cursor, snapshot=once
+            application.repository.event_page, session_id, cursor, snapshot=once, cache_text=once
         )
         if not page["exists"]:
             raise HTTPException(404, "Session not found")
@@ -256,6 +264,8 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
             observed_version = notification_version
             upper_bound = page["through"]
             deadline = time.monotonic() + 15
+            previous_draft = None
+            current_draft = initial_draft
             while not application.shutdown.is_set():
                 batch = current_page["events"]
                 for event in batch:
@@ -266,9 +276,32 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
                         return
                     current_page = await run_in_threadpool(
                         application.repository.event_page,
-                        session_id, current_cursor, through=upper_bound,
+                        session_id, current_cursor, through=upper_bound, cache_text=True,
                     )
                     continue
+                if len(batch) < 200:
+                    # Sample the draft before loading durable events so its
+                    # run_started always reaches the browser first.
+                    draft = current_draft
+                    active_draft = application.assistant_draft(session_id)
+                    if draft and (not active_draft or active_draft[0] != draft[0]):
+                        draft = None
+                    if draft != previous_draft:
+                        update = None
+                        if draft is not None:
+                            draft_id, content = draft
+                            append = bool(
+                                previous_draft and previous_draft[0] == draft_id
+                                and content.startswith(previous_draft[1])
+                            )
+                            update = {
+                                "id": draft_id, "append": append,
+                                "text": content[len(previous_draft[1]):] if append else content,
+                            }
+                        previous_draft = draft
+                        # These frames have no event ID. Last-Event-ID tracks only
+                        # durable events, and reconnect receives a full preview.
+                        yield f"event: assistant_draft\ndata: {json.dumps(update, ensure_ascii=False)}\n\n"
                 if (
                     time.monotonic() > deadline
                     or await request.is_disconnected()
@@ -282,9 +315,11 @@ def create_app(config, client_factory, *, frontend_origins=(), frontend_director
                 if len(batch) < 200:
                     await application.repository.wait_for_events(
                         session_id, observed_version,
-                        timeout=min(2.0, max(0.0, deadline - time.monotonic())),
+                        timeout=min(0.1 if previous_draft else 2.0,
+                                    max(0.0, deadline - time.monotonic())),
                     )
                 observed_version = application.repository.notification_version(session_id)
+                current_draft = application.assistant_draft(session_id)
                 # SQLite may wait on a writer or filesystem I/O. One worker call
                 # reads the whole page without blocking unrelated ASGI requests.
                 current_page = await run_in_threadpool(

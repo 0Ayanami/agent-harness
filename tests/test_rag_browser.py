@@ -3,7 +3,9 @@
 import os
 import socket
 import threading
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -11,6 +13,7 @@ import uvicorn
 from agent_harness import HarnessConfig
 from agent_harness.interfaces.web.app import create_app
 from agent_harness.interfaces.web.host import frontend_directory
+from agent_harness.services.library_rag import EVIDENCE_READY
 from test_services import FakeClient, response, text, tool, wait_until
 
 
@@ -32,13 +35,46 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
     model = FakeClient(
         [
             response(
+                text("检索阶段的内部文字"),
                 tool("search_library", {"query": "KITE_482"}, "browser-search"),
                 stop_reason="tool_use",
             ),
-            response(text(answer)),
+            response(text(EVIDENCE_READY)),
+            response(text(answer.replace("，", "，[S999]"))),
+            response(text(EVIDENCE_READY)),
             response(text(f"{favorite_answer}[S999]")),
         ]
     )
+    finish_first_answer = threading.Event()
+
+    @contextmanager
+    def model_stream(**arguments):
+        assert not arguments.get("tools")
+        reply = model.create(**arguments)
+
+        def events():
+            if len(model.calls) == 3:
+                yield text_delta("先核对校验点，[S")
+                assert finish_first_answer.wait(15), "The browser did not receive the partial answer"
+                yield text_delta("999]再重放事务日志。[S1]")
+            else:
+                yield text_delta(reply.content[0].text)
+            yield SimpleNamespace(type="message_stop")
+
+        class Stream:
+            def __iter__(self):
+                return events()
+
+            def get_final_message(self):
+                return reply
+
+        yield Stream()
+
+    def text_delta(value):
+        return SimpleNamespace(type="content_block_delta", index=0,
+                               delta=SimpleNamespace(type="text_delta", text=value))
+
+    model.messages.stream = model_stream
     app = create_app(
         HarnessConfig(tmp_path, "rag-browser-model"), lambda: model, frontend_directory=output
     )
@@ -153,9 +189,18 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
             page.get_by_test_id("send-message").click()
 
             assistants = page.locator(".message.assistant")
+            source = page.get_by_test_id("rag-source")
+            browser_api.expect(assistants.first.locator(".body")).to_have_text("先核对校验点，")
+            browser_api.expect(assistants.first.get_by_text("生成中，引用待校验")).to_be_visible()
+            browser_api.expect(source).to_have_count(0)
+            sid = page.evaluate("localStorage.getItem('harness.session')")
+            repository = app.state.application.repository
+            assert not any(event["kind"] == "assistant" for event in repository.events(sid))
+            page.reload()
+            browser_api.expect(assistants.first.locator(".body")).to_have_text("先核对校验点，")
+            finish_first_answer.set()
             browser_api.expect(assistants).to_have_count(1)
             browser_api.expect(assistants.first.locator(".body")).to_have_text(answer)
-            source = page.get_by_test_id("rag-source")
             browser_api.expect(source).to_have_count(1)
             browser_api.expect(source).to_contain_text("恢复手册.txt")
             browser_api.expect(page.get_by_test_id("rag-retrieval-status")).to_contain_text(
@@ -169,11 +214,12 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
             }
             assert first in model.calls[0]["system"] and other not in model.calls[0]["system"]
             assert model.calls[1]["messages"][-1]["content"][0]["tool_use_id"] == "browser-search"
+            assert model.calls[2]["messages"] == [{"role": "user", "content": "KITE_482 如何恢复？"}]
 
             page.reload()
             browser_api.expect(source).to_have_count(1)
             browser_api.expect(assistants).to_have_count(1)
-            assert len(model.calls) == 2
+            assert len(model.calls) == 3
             href = source.get_attribute("href")
             assert href and parse_qs(urlparse(href).query)["file"] == [first_id]
             assert parse_qs(urlparse(href).query)["chunk"]
@@ -192,13 +238,11 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
             browser_api.expect(assistants).to_have_count(2)
             browser_api.expect(assistants.last.locator(".body")).to_have_text(favorite_answer)
             browser_api.expect(source).to_have_count(2)
-            browser_api.expect(
-                page.get_by_text("部分来源编号未通过校验", exact=False)
-            ).to_be_visible()
+            browser_api.expect(page.get_by_text("部分来源编号未通过校验", exact=False)).to_have_count(2)
             assert posts[1]["library"]["favorites_only"] is True
             assert posts[1]["library"]["document_ids"] is None
             assert posts[1]["library"]["mode"] == "hybrid"
-            assert first in model.calls[2]["system"] and other not in model.calls[2]["system"]
+            assert first in model.calls[4]["system"] and other not in model.calls[4]["system"]
             browser_api.expect(page.get_by_test_id("rag-retrieval-status")).to_contain_text(
                 "关键词"
             )
@@ -215,13 +259,14 @@ def test_browser_library_question_scope_fallback_citations_and_replay(tmp_path):
                 page.get_by_text("本条回答没有可验证的来源引用。", exact=True)
             ).to_be_visible()
             assert posts[2]["library"]["mode"] == "vector"
-            assert len(model.calls) == 3
+            assert len(model.calls) == 5
             page.set_viewport_size({"width": 390, "height": 844})
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             page.screenshot(path=str(artifacts / "library-rag-mobile.png"), full_page=True)
             assert errors == []
             browser.close()
     finally:
+        finish_first_answer.set()
         server.should_exit = True
         thread.join(timeout=10)
         listener.close()

@@ -9,7 +9,7 @@ from agent_harness import HarnessConfig
 from agent_harness.application.sessions import SessionService
 from agent_harness.services.ingestion import IngestionService
 from agent_harness.services.library import LibraryService
-from agent_harness.services.library_rag import NO_EVIDENCE
+from agent_harness.services.library_rag import EVIDENCE_READY, NO_EVIDENCE
 from test_services import FakeClient, response, text, tool, wait_until
 
 
@@ -84,7 +84,7 @@ def events(rag, kind):
 
 def test_initial_retrieval_reaches_model_before_any_tool_and_citations_persist(rag):
     application, model, retrieval, _, first, _, _ = rag
-    model.replies = [response(text("先检查检查点，再回放日志。[S1]"))]
+    model.replies = [response(text(EVIDENCE_READY)), response(text("先检查检查点，再回放日志。[S1]"))]
     snapshot = ask(rag, "白鹭协议怎样恢复？", [first["id"]])
     assert retrieval.calls[0]["document_ids"] == [first["id"]]
     assert "白鹭协议规定恢复时先检查检查点，再回放日志。" in model.calls[0]["system"]
@@ -93,7 +93,9 @@ def test_initial_retrieval_reaches_model_before_any_tool_and_citations_persist(r
         "search_library",
         "read_library_document",
     }
-    assert len(model.calls) == 1  # No automatic cross-session memory extraction of documents.
+    assert len(model.calls) == 2  # Evidence selection and final answer, with no memory extraction.
+    assert not model.calls[1].get("tools")
+    assert "白鹭协议规定恢复时先检查检查点，再回放日志。" in model.calls[1]["system"]
     assert snapshot["history"][-1]["content"][0]["text"].endswith("[S1]")
     answer = events(rag, "library_answer")[-1]
     source = answer["citations"][0]
@@ -118,6 +120,7 @@ def test_agent_can_choose_search_mode_and_separate_queries_within_scope(rag):
             }, "hybrid"),
             stop_reason="tool_use",
         ),
+        response(text(EVIDENCE_READY)),
         response(text("先检查检查点。[S1]")),
     ]
     ask(rag, question, [first["id"]])
@@ -143,6 +146,7 @@ def test_real_read_tool_uses_dispatcher_and_matching_tool_result(rag):
             ),
             stop_reason="tool_use",
         ),
+        response(text(EVIDENCE_READY)),
         response(text("原文规定先检查检查点，再回放日志。[S1]")),
     ]
     snapshot = ask(rag, "白鹭协议怎样恢复？", [first["id"]])
@@ -150,17 +154,17 @@ def test_real_read_tool_uses_dispatcher_and_matching_tool_result(rag):
     result = model.calls[1]["messages"][-1]["content"][0]
     assert result["type"] == "tool_result" and result["tool_use_id"] == "read-original"
     assert json.loads(result["content"])["source"]["chunk_id"] == hit["chunk_id"]
-    assert len(model.calls) == 2
+    assert len(model.calls) == 3
     assert [message["role"] for message in snapshot["history"]] == ["user", "assistant"]
     assert events(rag, "tool_finished")[-1]["id"] == "read-original"
 
 
 def test_model_abstains_when_retrieved_passage_does_not_answer_the_question(rag):
     _, model, _, _, first, _, _ = rag
-    model.replies = [response(text(NO_EVIDENCE))]
+    model.replies = [response(text(EVIDENCE_READY)), response(text(NO_EVIDENCE))]
     ask(rag, "白鹭协议在哪一年制定？", [first["id"]])
-    assert len(model.calls) == 1
-    assert NO_EVIDENCE in model.calls[0]["system"]
+    assert len(model.calls) == 2
+    assert NO_EVIDENCE in model.calls[1]["system"]
     answer = events(rag, "library_answer")[-1]
     assert events(rag, "library_retrieval")[0]["sources"]
     assert "未找到足够的原文证据" in answer["text"]
@@ -184,6 +188,7 @@ def test_tool_parameters_cannot_expand_scope_and_invalid_citations_are_removed(r
             ),
             stop_reason="tool_use",
         ),
+        response(text(EVIDENCE_READY)),
         response(text("当前范围仅能根据白鹭原文回答。[S1][S999]")),
     ]
     snapshot = ask(rag, "白鹭协议", [first["id"]])
@@ -214,6 +219,8 @@ def test_source_is_revalidated_after_model_answer_before_citation_publication(ra
     library.patch(first["id"], favorite=True)
 
     def answer(**arguments):
+        if arguments.get("tools"):
+            return response(text(EVIDENCE_READY))
         if change == "delete":
             library.delete(first["id"])
         else:
@@ -241,7 +248,9 @@ def test_source_namespace_resets_for_each_turn_and_replays_after_service_reopen(
             ),
             stop_reason="tool_use",
         ),
+        response(text(EVIDENCE_READY)),
         response(text("白鹭恢复依赖检查点。[S1]")),
+        response(text(EVIDENCE_READY)),
         response(text("玄武超时是九秒。[S1]")),
     ]
     ask(rag, "白鹭协议", [first["id"]])
@@ -251,8 +260,8 @@ def test_source_namespace_resets_for_each_turn_and_replays_after_service_reopen(
     assert answers[0]["citations"][0]["document_id"] == first["id"]
     assert answers[1]["citations"][0]["document_id"] == second["id"]
     assert "白鹭协议规定" in model.calls[1]["messages"][-1]["content"][0]["content"]
-    assert "白鹭协议规定" not in model.calls[2]["system"]
-    assert model.calls[2]["messages"] == [{"role": "user", "content": "玄武协议"}]
+    assert "白鹭协议规定" not in model.calls[4]["system"]
+    assert model.calls[4]["messages"] == [{"role": "user", "content": "玄武协议"}]
     reopened = SessionService(application.config, FakeClient, retrieval=retrieval)
     try:
         assert reopened.repository.events(session_id) == application.repository.events(session_id)
@@ -266,7 +275,10 @@ def test_source_namespace_resets_for_each_turn_and_replays_after_service_reopen(
 
 def test_model_output_without_a_verifiable_source_is_not_published_as_a_grounded_answer(rag):
     _, model, _, _, first, _, _ = rag
-    model.replies = [response(text("不受原文支持的数字是 777。［s999］"))]
+    model.replies = [
+        response(text(EVIDENCE_READY)),
+        response(text("不受原文支持的数字是 777。［s999］")),
+    ]
     ask(rag, "白鹭协议", [first["id"]])
     answer = events(rag, "library_answer")[-1]
     assert answer["invalid_citations"] == ["S999"]
@@ -277,7 +289,10 @@ def test_model_output_without_a_verifiable_source_is_not_published_as_a_grounded
 
 def test_plain_chat_after_library_turn_restores_original_tools_and_no_library_prompt(rag):
     application, model, _, _, first, _, session_id = rag
-    model.replies = [response(text("白鹭原文。[S1]")), response(text("普通聊天正常"))]
+    model.replies = [
+        response(text(EVIDENCE_READY)), response(text("白鹭原文。[S1]")),
+        response(text("普通聊天正常")),
+    ]
     ask(rag, "白鹭协议", [first["id"]])
     application.submit(session_id, "普通聊天")
     wait_until(lambda: application.get(session_id).status == "idle", timeout=10)

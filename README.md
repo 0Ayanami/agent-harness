@@ -86,7 +86,13 @@ docker compose -f deployment/milvus/compose.yaml up -d --wait
 
 后端 `.env` 设置 `VECTOR_BACKEND=milvus`、`MILVUS_URI=http://127.0.0.1:19530`。代码默认保留qdrant以兼容旧工作区，切换必须显式配置；Milvus不可用时不会悄悄连接旧向量库。旧原件和embedding缓存保留，新后端在独立索引profile下重建。完整部署、停机与持久化说明见 [Milvus部署](deployment/milvus/README.md)，分层设计和 OCR 演进见 [技术手册](interview/crud-rag-interview-guide.md#milvus-hierarchy)。
 
-可选Redis配置为 `REDIS_URL=redis://127.0.0.1:6379/0`、`REDIS_PREFIX=ayanami`、`REDIS_CACHE_TTL=300`。会话和事件仍持久化在 `.runtime/agent-harness/sessions.sqlite3`，长期记忆位于工作区根目录 `.memory/`；Redis负责版本化会话热缓存与事件唤醒。设计、失效和故障回退见 [Redis接入说明](interview/backend-engineering-interview-guide.md#cache)。
+可选Redis配置为 `REDIS_URL=redis://127.0.0.1:6379/0`、`REDIS_PREFIX=ayanami`、`REDIS_CACHE_TTL=300`。会话和事件仍持久化在 `.runtime/agent-harness/sessions.sqlite3`，长期记忆位于工作区根目录 `.memory/`。Redis 缓存网页回放需要的用户/助手文本事件，不保存模型的完整 `message list`、工具输入输出、审批状态或 memory。后端首次打开会话时从 SQLite 恢复完整模型上下文；同一进程内的后续轮次使用会话内存。
+
+用户消息和完整的助手文本事件提交到 SQLite 后，后端主动更新 Redis 文本缓存。缓存已包含上一版记录时，复制已有文本并附加新事件，无需重新查询旧文本。Redis 原子比较事件版本，避免迟到的历史回放覆盖新记录。
+
+网页打开或切换会话时，通过 `/api/agent/sessions/{id}/events?once=true` 读取回放。服务先从 SQLite 确认会话存在、回放边界和最新文本版本，再读取 Redis。缓存缺失、过期、版本不符或 Redis 故障时，直接从 SQLite 回放，Redis 可用时回填。工具轨迹、RAG 引用和审批事件从 SQLite 读取，与文本按事件 ID 合并。缓存默认保留 300 秒，超过 2 MiB 的文本记录跳过缓存。Pub/Sub 只发送会话 ID 用于唤醒消费者。
+
+网页通过 SSE 接收模型文本增量。生成中刷新页面可重新取得当前草稿，完整回复会取代草稿并进入 SQLite 和 Redis，模型输出中断时清除草稿。资料库问答先查询证据，允许 Agent 调用资料库工具补充检索，再单独流式生成回答。草稿期间显示引用待校验，最终通过来源范围与文档版本校验的引用才会展示。
 
 顶栏可进入 Agent 工作台和资料库。左侧的 **Skills** 列出当前工作目录 `skills/` 中的技能，子目录用于分组。点击技能可在站内抽屉查看 `SKILL.md` 原文。会话创建与切换单独放在侧栏。迁移来源见 `interfaces/web/frontend/MIGRATION.md`。
 
@@ -232,6 +238,10 @@ HTTP 提交立即返回 `202`，执行进入会话的工作线程。SSE 按事�
 本版是**本机单进程应用**，默认仅绑定 `127.0.0.1`，没有远程登录或多实例部署能力。SSE 允许断线重连，写请求检查同源与客户端请求头。项目记忆在同一应用内共享一个维护锁，防止并发会话相互覆盖。停止执行会取消等待中的确认并清理本会话 shell；已经发出的模型请求需要等待返回或超时，之后才会结束该 turn。
 
 默认静态模式只有一个 Python 服务。开发模式额外运行 Next，只允许启动参数指定的 loopback 前端 origin；不允许任意 CORS 或伪造转发头。`/api/agent/*` 与原 `/api/*` 使用同一个路由与权限政策。事件流带有 `no-transform`，避免代理压缩缓冲阻止及时显示工具和审批。重放请求在固定事件上界内读取全部分页，刷新后用持久事件恢复对话。
+
+### Docker Cron 调度
+
+网页后端可以把到期检测交给独立 Cron 容器。容器负责持久化计划和待交付记录，后端仍在会话空闲时派发给 Agent。启用后启动项目之前先确保 Cron 容器健康。 [Cron 启动、旧计划迁移与恢复](deployment/cron/README.md)
 
 ### arXiv MCP
 

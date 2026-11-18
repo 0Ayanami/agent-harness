@@ -9,7 +9,10 @@ SystemPrompt = Callable[[list], str]
 
 
 class ModelPort(Protocol):
-    def complete(self, *, state: RecoveryState | None = None, **arguments) -> Any: ...
+    def complete(
+        self, *, state: RecoveryState | None = None,
+        on_text: Callable[[str], None] | None = None, **arguments,
+    ) -> Any: ...
     def is_prompt_too_long_error(self, error: Exception) -> bool: ...
 
 

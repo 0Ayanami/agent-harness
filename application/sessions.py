@@ -4,10 +4,12 @@ import logging
 import re
 import shutil
 import threading
-from dataclasses import dataclass, field
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-from ..core.messages import json_value, repair_interrupted_turn
+from ..core.messages import extract_text, json_value, repair_interrupted_turn
+from ..infrastructure.cron_client import CronClient, RemoteScheduler
 from ..infrastructure.sessions import SessionRepository
 from ..infrastructure.session_cache import RedisSessionCache
 from ..services.library_rag import library_options
@@ -36,15 +38,20 @@ class LiveSession:
     worker: threading.Thread | None = None
     retired: bool = False
     cancelled_cron_generation: int = 0
+    assistant_draft: tuple[str, str] | None = None
 
 
 class SessionService:
-    def __init__(self, config, client_factory, *, retrieval=None, library=None, resume_schedules=False):
+    def __init__(
+        self, config, client_factory, *, retrieval=None, library=None,
+        resume_schedules=False, stream_answers=False,
+    ):
         self.config = config
         self.client_factory = client_factory
         self.retrieval = retrieval
         self.library = library
         self.resume_schedules = resume_schedules
+        self.stream_answers = stream_answers
         database_path = config.data_dir / "sessions.sqlite3"
         cache = RedisSessionCache(
             config.redis_url, database_path,
@@ -58,13 +65,21 @@ class SessionService:
         self.memory_lock = threading.RLock()
         self.shutdown = threading.Event()
         self.pump = None
+        self.cron = CronClient(config.cron_service_url, config.data_dir) if resume_schedules and config.cron_service_url else None
+        self._cron_initialized = False
+        self._cron_booted = False
 
     def start(self):
         if self.pump is None:
             self.repository.start()
             for session_id in self.repository.pending_cleanup():
                 self._cleanup_deleted(session_id)
-            if self.resume_schedules:
+            if self.cron:
+                try:
+                    self._initialize_cron()
+                except (OSError, ValueError):
+                    logger.warning("Cron synchronization will retry after startup")
+            if self.resume_schedules and not self.cron:
                 for record in self.repository.list():
                     session_id = record["id"]
                     scheduler = self._stored_scheduler(session_id)
@@ -91,6 +106,7 @@ class SessionService:
             memory_lock=self.memory_lock,
             retrieval=self.retrieval,
             library=self.library,
+            scheduler=self._remote_scheduler(session_id) if self.cron else None,
             personalized=record["personalized"],
             temporary=record["temporary"],
         )
@@ -115,7 +131,7 @@ class SessionService:
         record = self.repository.create(personalized=personalized, temporary=temporary)
         return self.snapshot(record["id"])
 
-    def snapshot(self, session_id):
+    def snapshot(self, session_id, *, include_history=True):
         # Avoid the execution lock: snapshots must work while a worker awaits approval.
         with self.lock:
             session = self.sessions.get(session_id)
@@ -128,7 +144,20 @@ class SessionService:
                 "approvals": session.approvals.snapshot() if session else [],
                 "cursor": self.repository.cursor(session_id),
             }
-        snapshot["history"] = json_value(snapshot["history"])
+        if include_history:
+            snapshot["history"] = json_value(snapshot["history"])
+        elif self.repository.has_transcript(session_id):
+            # Web restores visible text from the cached event replay, without
+            # serializing model/tool context a second time in its snapshot.
+            snapshot["history"] = []
+        else:
+            # Sessions imported before durable events still need a text fallback.
+            snapshot["history"] = [
+                {"role": message["role"], "content": text}
+                for message in snapshot["history"]
+                if message["role"] in {"user", "assistant"}
+                and (text := extract_text(message["content"]))
+            ]
         # The shared memory lock may be held by an extraction in a different session.
         if session is None:
             snapshot["state"] = {
@@ -145,7 +174,7 @@ class SessionService:
                 if not session.retired:
                     raise
                 # A concurrent delete may remove task files after the snapshot captured the record.
-                return self.snapshot(session_id)
+                return self.snapshot(session_id, include_history=include_history)
         return snapshot
 
     def _retire(self, session):
@@ -169,14 +198,14 @@ class SessionService:
                 thread = self.retiring_schedulers.get(session_id)
                 if archived is False and thread is not None and thread.is_alive():
                     raise SessionConflict("Wait for the conversation scheduler to stop")
-                self.repository.update(session_id, **changes)
+                self._update_options(session_id, **changes)
             else:
                 with session.lock:
                     if session.status == "running":
                         raise SessionConflict("Wait for the current turn to finish")
                     if archived is True and session.runtime.has_live_workers():
                         raise SessionConflict("Wait for background work and teammates to finish")
-                    options = self.repository.update(session_id, **changes)
+                    options = self._update_options(session_id, **changes)
                     session.record.update(options)
                     if options["archived"]:
                         self._retire(session)
@@ -185,6 +214,20 @@ class SessionService:
                             personalized=options["personalized"], temporary=options["temporary"]
                         )
         return self.snapshot(session_id)
+
+    def _update_options(self, session_id, **changes):
+        archived = changes.get("archived")
+        if not self.cron or archived is None:
+            return self.repository.update(session_id, **changes)
+        previous = self.repository.get(session_id)["archived"]
+        if previous == archived:
+            return self.repository.update(session_id, **changes)
+        self.cron.call("pause", session_id, paused=archived)
+        try:
+            return self.repository.update(session_id, **changes)
+        except Exception:
+            self.cron.call("pause", session_id, paused=previous)
+            raise
 
     def delete(self, session_id):
         with self.lock:
@@ -206,6 +249,8 @@ class SessionService:
         try:
             if not SESSION_ID.fullmatch(session_id) or path.resolve() != path:
                 raise ValueError("Unsafe session state path")
+            if self.cron:
+                self.cron.call("purge", session_id)
             try:
                 shutil.rmtree(path)
             except FileNotFoundError:
@@ -215,9 +260,14 @@ class SessionService:
             return
         self.repository.finish_cleanup(session_id)
 
-    def _stored_scheduler(self, session_id):
+    def _remote_scheduler(self, session_id):
+        return RemoteScheduler(self.session_root / session_id, self.shutdown, self.cron, session_id)
+
+    def _stored_scheduler(self, session_id, *, legacy=False):
         if not SESSION_ID.fullmatch(session_id):
             return None
+        if self.cron and not legacy:
+            return self._remote_scheduler(session_id)
         state_dir = self.session_root / session_id
         scheduler = Scheduler(state_dir, self.shutdown)
         try:
@@ -237,7 +287,7 @@ class SessionService:
         ]
 
     def scheduled_tasks(self, session_id=None):
-        now = datetime.now()
+        now = datetime.fromisoformat(self.cron.call("now")) if self.cron else datetime.now()
         with self.lock:
             records = (
                 self.repository.list() if session_id is None else [self.repository.get(session_id)]
@@ -258,7 +308,7 @@ class SessionService:
             for scheduler, record in sources
             for item in self._scheduled_items(scheduler, record, now)
         ]
-        return {"items": items, "server_time": now.astimezone().isoformat()}
+        return {"items": items, "server_time": (now if self.cron else now.astimezone()).isoformat()}
 
     def create_scheduled_task(self, session_id, *, cron_expr, prompt, recurring, persistent):
         cron = " ".join(cron_expr.split())
@@ -320,6 +370,19 @@ class SessionService:
 
     def _run(self, session, memory_source):
         outcome = "completed"
+        session_id = session.record["id"]
+        last_wakeup = 0.0
+
+        def update_draft(draft):
+            nonlocal last_wakeup
+            if session.assistant_draft == draft:
+                return
+            session.assistant_draft = draft
+            now = time.monotonic()
+            if draft is None or now - last_wakeup >= 0.05:
+                last_wakeup = now
+                self.repository.notify_draft(session_id)
+
         # A scheduler/background follow-up must not inherit a previous user scope.
         options, session.active_library = session.active_library, None
         try:
@@ -329,6 +392,8 @@ class SessionService:
             }
             if options is not None:
                 arguments["library"] = options
+            if self.stream_answers:
+                arguments["on_draft"] = update_draft
             session.runtime.run(
                 session.record["history"],
                 session.active_request,
@@ -340,11 +405,19 @@ class SessionService:
             outcome = "failed"
             session.runtime.emit("error", {"message": f"{type(error).__name__}: {error}"})
         finally:
+            update_draft(None)
             repair_interrupted_turn(session.record["history"])
             with session.lock:
                 self._checkpoint(session)
                 session.status = "idle"
                 session.runtime.emit("run_finished", {"outcome": outcome})
+
+    def assistant_draft(self, session_id):
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is not None and not session.runtime.cancelled.is_set():
+                return session.assistant_draft
+        return None
 
     def cancel(self, session_id):
         session = self.get(session_id)
@@ -352,11 +425,54 @@ class SessionService:
             if session.retired:
                 raise SessionConflict("The conversation has been archived or deleted")
             session.runtime.cancel()
-            session.cancelled_cron_generation = session.runtime.scheduler.due_generation()
+            self.repository.notify_draft(session_id)
             session.approvals.cancel_all()
+            try:
+                session.cancelled_cron_generation = session.runtime.scheduler.due_generation()
+            except OSError:
+                # Cancellation of the in-process run still works during a detector outage.
+                logger.warning("Could not record the current Cron generation")
+
+    def _initialize_cron(self):
+        if self._cron_initialized:
+            return
+        with self.lock:
+            if not self._cron_booted:
+                self.cron.call("boot")
+                self._cron_booted = True
+            for archived in (False, True):
+                for record in self.repository.list(archived=archived):
+                    sid = record["id"]
+                    legacy = self._stored_scheduler(sid, legacy=True)
+                    if legacy:
+                        self.cron.call("migrate", sid, active=not archived,
+                                       jobs=[asdict(job) for job in legacy.read_durable_jobs()])
+                    self.cron.call("pause", sid, paused=archived)
+            for sid in self.repository.pending_cleanup():
+                self._cleanup_deleted(sid)
+            self._cron_initialized = True
+
+    def _due_sessions(self):
+        if not self.cron:
+            return {}
+        try:
+            self._initialize_cron()
+            due = {row["session_id"]: row["latest"] for row in self.cron.call("due")}
+            for sid in due:
+                try:
+                    self.get(sid)
+                except (KeyError, SessionConflict):
+                    # Local SQLite is authoritative for whether this session may run.
+                    continue
+                except Exception:
+                    logger.exception("Could not open a conversation for Cron dispatch")
+            return due
+        except (OSError, ValueError):
+            return {}
 
     def _pump_events(self):
         while not self.shutdown.wait(0.3):
+            due = self._due_sessions()
             with self.lock:
                 sessions = list(self.sessions.values())
                 for session_id, thread in list(self.retiring_schedulers.items()):
@@ -369,11 +485,17 @@ class SessionService:
                     if session.retired or session.status != "idle":
                         continue
                     if session.runtime.cancelled.is_set():
-                        if not session.runtime.scheduler.has_new_due_job(
-                            session.cancelled_cron_generation
-                        ):
+                        generation = due.get(session.record["id"], 0)
+                        is_new = (generation > session.cancelled_cron_generation if self.cron
+                                  else session.runtime.scheduler.has_new_due_job(session.cancelled_cron_generation))
+                        if not is_new:
                             continue
                         session.runtime.cancelled.clear()
+                    if session.record["id"] in due:
+                        try:
+                            session.runtime.scheduler.stage_due()
+                        except OSError:
+                            continue
                     if session.runtime.has_events():
                         self._launch(session)
 
@@ -389,3 +511,5 @@ class SessionService:
         if self.pump:
             self.pump.join(timeout=1)
         self.repository.close()
+        if self.cron:
+            self.cron.close()

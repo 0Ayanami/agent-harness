@@ -3,6 +3,7 @@
 import os
 import socket
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,9 +24,27 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
     if not Path(executable).exists():
         pytest.skip("Set HARNESS_BROWSER_EXECUTABLE to an installed Chromium browser")
 
+    send_second = threading.Event()
+    finish_reply = threading.Event()
+
     class BrowserModel:
         def __init__(self):
-            self.messages = SimpleNamespace(create=self.create)
+            self.messages = SimpleNamespace(create=self.create, stream=self.stream)
+
+        @contextmanager
+        def stream(self, **arguments):
+            reply = self.create(**arguments)
+
+            def events():
+                if reply.stop_reason == "end_turn":
+                    yield chunk("验证完成。")
+                    assert send_second.wait(15), "Browser did not render the first partial reply"
+                    yield chunk("命令输出为 browser-ready，")
+                    assert finish_reply.wait(15), "Browser did not render the second partial reply"
+                    yield chunk("任务已经保存在当前会话。")
+                yield SimpleNamespace(type="message_stop")
+
+            yield BrowserStream(events(), reply)
 
         def create(self, **arguments):
             if arguments["max_tokens"] == 1000:
@@ -39,6 +58,21 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
                 tool("bash", {"command": "echo browser-ready"}, "bash-1"),
                 stop_reason="tool_use",
             )
+
+    class BrowserStream:
+        def __init__(self, events, reply):
+            self.events = events
+            self.reply = reply
+
+        def __iter__(self):
+            return self.events
+
+        def get_final_message(self):
+            return self.reply
+
+    def chunk(value):
+        return SimpleNamespace(type="content_block_delta", index=0,
+                               delta=SimpleNamespace(type="text_delta", text=value))
 
     output = frontend_directory() / "out"
     assert (output / "zh" / "index.html").exists(), (
@@ -119,9 +153,19 @@ def test_browser_chat_approval_reload_and_responsive_layout(tmp_path):
             page.reload()
             browser_api.expect(page.locator(".approval")).to_be_visible()
             page.get_by_role("button", name="允许执行").click()
-            browser_api.expect(page.locator(".message.assistant .body")).to_contain_text(
-                "browser-ready"
-            )
+            assistant = page.locator(".message.assistant .body")
+            browser_api.expect(assistant).to_have_text("验证完成。")
+            sid = page.evaluate("localStorage.getItem('harness.session')")
+            session_repository = app.state.application.repository
+            assert not any(event["kind"] == "assistant" for event in session_repository.events(sid))
+            send_second.set()
+            browser_api.expect(assistant).to_have_text("验证完成。命令输出为 browser-ready，")
+            page.reload()
+            browser_api.expect(assistant).to_have_text("验证完成。命令输出为 browser-ready，")
+            finish_reply.set()
+            browser_api.expect(assistant).to_have_text(
+                "验证完成。命令输出为 browser-ready，任务已经保存在当前会话。")
+            browser_api.expect(assistant).to_have_count(1)
             browser_api.expect(page.locator("#runtime-status")).to_have_text("准备就绪")
             browser_api.expect(page.locator("#tasks")).to_contain_text("网页联调验证")
             browser_api.expect(page.locator("#tool-count")).to_have_text("2")

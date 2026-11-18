@@ -8,12 +8,36 @@ class ModelGateway:
     extract_text = staticmethod(extract_text)
     has_tool_use = staticmethod(lambda content: bool(tool_calls(content)))
 
-    def complete(self, *, state=None, **arguments):
+    def complete(self, *, state=None, on_text=None, **arguments):
         state = state or RecoveryState(self.config.model)
+        stream_message = getattr(self.client.messages, "stream", None)
+        if on_text is not None and callable(stream_message):
+            return self.with_retry(
+                lambda: self._stream(stream_message, state.current_model, on_text, arguments),
+                state,
+            )
         return self.with_retry(
             lambda: self.client.messages.create(model=state.current_model, **arguments),
             state,
         )
+
+    @staticmethod
+    def _stream(stream_message, model, on_text, arguments):
+        # Reset the preview at the beginning of each retry.
+        on_text("")
+        blocks = {}
+        with stream_message(model=model, **arguments) as stream:
+            for event in stream:
+                if event.type == "content_block_start" and event.content_block.type == "text":
+                    blocks[event.index] = event.content_block.text
+                    if event.content_block.text:
+                        on_text("\n".join(blocks.values()))
+                elif event.type == "content_block_delta" and event.delta.type == "text_delta":
+                    blocks[event.index] = blocks.get(event.index, "") + event.delta.text
+                    on_text("\n".join(blocks.values()))
+                elif event.type == "message_stop":
+                    return stream.get_final_message()
+        raise RuntimeError("Model stream ended before the response was complete")
 
     def __init__(self, config, client):
         self.config = config

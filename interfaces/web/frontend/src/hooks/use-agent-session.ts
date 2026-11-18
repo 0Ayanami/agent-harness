@@ -12,6 +12,7 @@ interface SessionView {
   busy: boolean;
   cancelling: boolean;
   cursor: number;
+  draft?: RuntimeMessage;
   retrieval?: LibraryRetrieval;
 }
 
@@ -32,7 +33,8 @@ function eventMessage(event: RuntimeEvent): RuntimeMessage | null {
   const content = value(payload, "text");
   if (kind === "user" || kind === "assistant") {
     if (!content) return null;
-    return { id: `event-${id}`, runId: value(payload, "run_id") || undefined, trace: payload.scope === "subagent", step: {
+    const streamId = kind === "assistant" && value(payload, "stream_id");
+    return { id: streamId ? `stream-${streamId}` : `event-${id}`, runId: value(payload, "run_id") || undefined, trace: payload.scope === "subagent", step: {
       type: kind === "user" ? "user_message" : "assistant_text",
       content, annotation: payload.scope === "subagent" ? "subagent" : "",
     } };
@@ -81,7 +83,10 @@ function applyEvent(view: SessionView, event: RuntimeEvent, replay = false): Ses
   let next = { ...view, cursor: Math.max(view.cursor, event.id) };
   const entry = eventMessage(event);
   // Persisted events provide one ordered transcript, including errors and cancellations.
-  if (entry) next.messages = [...next.messages, entry];
+  if (entry) {
+    next.messages = [...next.messages, entry];
+    if (next.draft?.id === entry.id) next.draft = undefined;
+  }
   if (event.kind === "library_retrieval") {
     next.retrieval = { run_id: value(event.payload, "run_id"), mode: value(event.payload, "mode"),
       warning: value(event.payload, "warning") || null, sources: sourceList(event.payload.sources),
@@ -103,7 +108,11 @@ function applyEvent(view: SessionView, event: RuntimeEvent, replay = false): Ses
   if (event.kind === "run_started") next.retrieval = undefined;
   if (replay) return next;
   if (event.kind === "run_started") { next.busy = true; next.cancelling = false; }
-  if (event.kind === "run_finished") { next.busy = false; next.cancelling = false; }
+  if (event.kind === "run_finished") {
+    next.busy = false;
+    next.cancelling = false;
+    next.draft = undefined;
+  }
   if (event.kind === "approval_requested") {
     const payload = event.payload;
     if (typeof payload.id === "string" && typeof payload.name === "string" && payload.input && typeof payload.input === "object") {
@@ -156,7 +165,7 @@ export function useAgentSession() {
 
   const refreshSnapshot = useCallback(async (sessionId: string, version: number) => {
     const revision = settingsRevision.current;
-    const snapshot = await agentApi<SessionSnapshot>(`/sessions/${sessionId}`);
+    const snapshot = await agentApi<SessionSnapshot>(`/sessions/${sessionId}?include_history=false`);
     if (!mounted.current || selectedId.current !== sessionId || generation.current !== version) return;
     setView((current) => {
       if (!current || current.snapshot.id !== sessionId) return current;
@@ -184,12 +193,12 @@ export function useAgentSession() {
     setError(null);
     setConnection("connecting");
     try {
-      const snapshot = await agentApi<SessionSnapshot>(`/sessions/${sessionId}`, { signal: controller.signal });
+      const snapshot = await agentApi<SessionSnapshot>(`/sessions/${sessionId}?include_history=false`, { signal: controller.signal });
       const events = await replayEvents(sessionId, controller.signal);
       if (!mounted.current || version !== generation.current) return;
       seen.current = new Set(events.map((event) => event.id));
-      // history/cursor are not an atomic read while a worker is running. Rebuilding
-      // messages from events avoids skipping a newly emitted assistant response.
+      // Replay merges cached text with durable tool/citation events. Rebuilding
+      // from events also preserves the transcript across model-context compaction.
       // Snapshot remains authoritative for already-resolved approvals after restart.
       const hasTranscript = events.some((event) => event.kind === "user" || event.kind === "assistant" || event.kind === "scheduled");
       let restored: SessionView = {
@@ -203,6 +212,24 @@ export function useAgentSession() {
       source.current = live;
       live.onopen = () => { if (generation.current === version) setConnection("connected"); };
       live.onerror = () => { if (generation.current === version) setConnection("reconnecting"); };
+      live.addEventListener("assistant_draft", (message) => {
+        if (!mounted.current || generation.current !== version) return;
+        try {
+          const update = JSON.parse(message.data) as { id: string; text: string; append: boolean } | null;
+          setView((current) => {
+            if (!current || current.snapshot.id !== sessionId) return current;
+            if (!update) return { ...current, draft: undefined };
+            if (!current.busy) return current;
+            const id = `stream-${update.id}`;
+            if (current.messages.some((entry) => entry.id === id)) return current;
+            const previous = update.append && current.draft?.id === id ? current.draft.step.content : "";
+            const annotation = current.retrieval?.run_id === update.id ? "ragCheckingCitations" : "";
+            return { ...current, draft: { id, trace: false, step: {
+              type: "assistant_text", content: previous + update.text, annotation,
+            } } };
+          });
+        } catch (issue) { reportError(issue); }
+      });
       live.onmessage = (message) => {
         if (!mounted.current || generation.current !== version) return;
         try {

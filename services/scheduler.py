@@ -79,7 +79,7 @@ class Scheduler:
                     candidate = day.replace(hour=hour_value, minute=minute_value)
                     if candidate < start or candidate.strftime("%Y-%m-%d %H:%M") == last_fired:
                         continue
-                    if datetime.fromtimestamp(candidate.timestamp()) == candidate:
+                    if datetime.fromtimestamp(candidate.timestamp(), tz=candidate.tzinfo) == candidate:
                         return max(now, candidate)
         return None
 

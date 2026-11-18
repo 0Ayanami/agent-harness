@@ -27,7 +27,7 @@ export function AgentWorkbench() {
   const bottom = useRef<HTMLDivElement>(null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const { view, loading, connection, health } = agent;
-  const messages = view?.messages ?? [];
+  const messages = view?.draft ? [...view.messages, view.draft] : view?.messages ?? [];
   const toolCount = messages.filter((message) => message.step.type === "tool_call").length;
   const status = view?.cancelling ? "cancelling" : view?.approvals.length ? "approval" : view?.busy ? "running" : "ready";
   const optionsDisabled = loading || !view || view.busy || agent.sessionActionPending;
@@ -41,6 +41,7 @@ export function AgentWorkbench() {
     if (selected) setLibrary({ enabled: true, document_ids: [selected], favorites_only: false, mode: "hybrid" });
   }, []);
   useEffect(() => { bottom.current?.scrollIntoView({ block: "nearest", behavior: "smooth" }); }, [messages.length, view?.approvals.length]);
+  useEffect(() => { if (view?.draft) bottom.current?.scrollIntoView({ block: "nearest" }); }, [view?.draft]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();

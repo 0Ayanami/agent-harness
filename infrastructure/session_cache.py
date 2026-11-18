@@ -1,6 +1,6 @@
-"""Optional Redis hot records and lossy wakeups, never authoritative session data.
+"""Optional Redis text transcripts and lossy wakeups, never model history.
 
-SQLite revisions protect cache reads; Pub/Sub only wakes a durable event replay.
+SQLite event cursors protect cache reads; Pub/Sub only wakes a durable event replay.
 The single subscriber resolves asyncio waiters without occupying ASGI workers.
 """
 
@@ -14,6 +14,21 @@ from collections import OrderedDict
 
 
 logger = logging.getLogger(__name__)
+
+# Historical replay may finish after a newer message has already warmed the key.
+# Compare and replace in one Redis operation so it cannot roll the key backwards.
+PUT_TRANSCRIPT = """
+local previous = redis.call('GET', KEYS[1])
+if previous then
+    local ok, data = pcall(cjson.decode, previous)
+    if ok and type(data) == 'table' and type(data.version) == 'table'
+       and type(data.version.id) == 'number' and data.version.id > tonumber(ARGV[1]) then
+        return 0
+    end
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
 
 
 class RedisSessionCache:
@@ -50,11 +65,16 @@ class RedisSessionCache:
             except (ImportError, ValueError):
                 logger.warning("Redis session acceleration unavailable; using SQLite")
 
-    def _key(self, session_id, revision):
-        return f"{self.namespace}:record:{session_id}:{revision}"
+    def _key(self, session_id):
+        # A new key format leaves old full-history records to expire naturally.
+        return f"{self.namespace}:transcript:v1:{session_id}"
+
+    @property
+    def can_access(self):
+        return self.client is not None and time.monotonic() >= self._disabled_until and not self._stop.is_set()
 
     def _command(self, function, default=None):
-        if self.client is None or time.monotonic() < self._disabled_until or self._stop.is_set():
+        if not self.can_access:
             return default
         try:
             result = function()
@@ -69,25 +89,34 @@ class RedisSessionCache:
             logger.warning("Redis session acceleration paused (%s)", type(error).__name__)
             return default
 
-    def get(self, session_id, revision, flags, updated_at):
-        value = self._command(lambda: self.client.get(self._key(session_id, revision)))
+    def get(self, session_id, version):
+        value = self._command(lambda: self.client.get(self._key(session_id)))
         if not value:
             return None
         try:
             if len(value.encode() if isinstance(value, str) else value) > self.MAX_RECORD_BYTES:
                 return None
             envelope = json.loads(value)
-            record = envelope["record"]
-            if (type(envelope["revision"]) is not int or envelope["revision"] != revision
-                    or record["id"] != session_id
-                    or record["updated_at"] != updated_at
-                    or not isinstance(record["history"], list)
-                    or any(type(record.get(name)) is not bool or record[name] != flag
-                           for name, flag in flags.items())):
+            events = envelope["events"]
+            if envelope["version"] != version or not isinstance(events, list):
                 return None
-            if not {"title", "created_at", "updated_at"} <= record.keys():
+            previous = 0
+            for event in events:
+                if (set(event) != {"id", "session_id", "kind", "payload", "created_at"}
+                        or type(event["id"]) is not int or event["id"] <= previous
+                        or event["session_id"] != session_id
+                        or event["kind"] not in {"user", "assistant"}
+                        or not isinstance(event["created_at"], str)):
+                    return None
+                payload = event["payload"]
+                if (not isinstance(payload, dict) or "text" not in payload
+                        or not payload.keys() <= {"text", "scope", "run_id", "stream_id"}
+                        or any(not isinstance(item, str) for item in payload.values())):
+                    return None
+                previous = event["id"]
+            if previous != version["id"] or (events and events[-1]["created_at"] != version["created_at"]):
                 return None
-            return record
+            return events
         except (KeyError, TypeError, ValueError):
             return None
 
@@ -95,19 +124,19 @@ class RedisSessionCache:
         with self._lock:
             return {
                 "configured": True,
-                "cache_available": bool(self.client is not None and self._command_ok
-                                        and time.monotonic() >= self._disabled_until
-                                        and not self._stop.is_set()),
+                "cache_available": self._command_ok and self.can_access,
                 "notifications_available": self._ready and not self._stop.is_set(),
             }
 
-    def put(self, session_id, revision, record):
-        payload = json.dumps({"revision": revision, "record": record}, ensure_ascii=False)
+    def put(self, session_id, version, events):
+        payload = json.dumps({"version": version, "events": events}, ensure_ascii=False)
         if len(payload.encode()) <= self.MAX_RECORD_BYTES:
-            self._command(lambda: self.client.set(self._key(session_id, revision), payload, ex=self.ttl))
+            self._command(lambda: self.client.eval(
+                PUT_TRANSCRIPT, 1, self._key(session_id), version["id"], payload, self.ttl,
+            ))
 
-    def discard(self, session_id, revision):
-        self._command(lambda: self.client.delete(self._key(session_id, revision)))
+    def discard(self, session_id):
+        self._command(lambda: self.client.delete(self._key(session_id)))
 
     @property
     def ready(self):
@@ -130,7 +159,7 @@ class RedisSessionCache:
             except RuntimeError:
                 pass  # A disconnected request may already have closed its loop.
 
-    def _notify(self, session_id):
+    def notify_local(self, session_id):
         with self._lock:
             self._versions[session_id] = self._versions.get(session_id, 0) + 1
             self._versions.move_to_end(session_id)
@@ -141,8 +170,8 @@ class RedisSessionCache:
 
     def publish(self, session_id):
         # Local delivery remains immediate even during a Redis outage. Redis
-        # carries only the ID, never history, approvals, memory or tool content.
-        self._notify(session_id)
+        # Pub/Sub carries only the ID, never text or tool/approval content.
+        self.notify_local(session_id)
         self._command(lambda: self.client.publish(self.channel, session_id))
 
     async def wait(self, session_id, version, *, timeout=2.0):
@@ -196,7 +225,7 @@ class RedisSessionCache:
                         if isinstance(identifier, bytes):
                             identifier = identifier.decode("utf-8", errors="ignore")
                         if isinstance(identifier, str) and 0 < len(identifier) <= 128:
-                            self._notify(identifier)
+                            self.notify_local(identifier)
             except Exception:
                 self._set_ready(False)
                 self._stop.wait(2)

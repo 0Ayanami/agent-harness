@@ -27,6 +27,7 @@ import uvicorn
 
 from agent_harness import HarnessConfig
 from agent_harness.interfaces.web.app import create_app
+from agent_harness.services.library_rag import EVIDENCE_READY, NO_EVIDENCE
 
 
 HEADERS = {"X-Agent-Client": "web"}
@@ -38,7 +39,12 @@ class SyntheticModel:
 
     def create(self, **arguments):
         time.sleep(0.05)
-        content = "Synthetic answer [S1]" if "search_library" in str(arguments.get("tools")) else "Synthetic answer"
+        if "search_library" in str(arguments.get("tools")):
+            content = EVIDENCE_READY
+        elif NO_EVIDENCE in arguments.get("system", ""):
+            content = "Synthetic answer [S1]"
+        else:
+            content = "Synthetic answer"
         return SimpleNamespace(
             content=[SimpleNamespace(type="text", text=content)], stop_reason="end_turn"
         )

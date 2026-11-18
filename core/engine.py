@@ -1,5 +1,7 @@
 """The reusable model/tool loop. No terminal, HTTP, persistence or team threads."""
 
+from uuid import uuid4
+
 from .messages import extract_text, json_value, tool_calls
 from .models import RecoveryState
 from .ports import ContextPort, DispatcherPort, ModelPort, SystemPrompt, ToolPool
@@ -37,6 +39,7 @@ class AgentEngine:
         max_iterations=None,
         allow_background=True,
         scope="agent",
+        on_draft=None,
     ):
         state = RecoveryState(self.config.model)
         max_tokens = self.config.max_tokens
@@ -52,36 +55,49 @@ class AgentEngine:
             self.context.prepare_context(history, request)
             definitions, handlers = tool_pool()
             self.emit("model_started", {"model": state.current_model, "iteration": iteration})
+            stream_id = uuid4().hex if on_draft else None
+            arguments = {
+                "system": system_prompt(history), "messages": history,
+                "tools": definitions, "max_tokens": max_tokens,
+            }
+            if on_draft:
+                def update_draft(text):
+                    self._check_cancelled()
+                    on_draft((stream_id, text) if text else None)
+
+                arguments["on_text"] = update_draft
             try:
-                answer = self.gateway.complete(
-                    state=state,
-                    system=system_prompt(history),
-                    messages=history,
-                    tools=definitions,
-                    max_tokens=max_tokens,
-                )
-            except Exception as error:
-                if (
-                    self.gateway.is_prompt_too_long_error(error)
-                    and not state.has_attempted_reactive_compact
-                ):
-                    history[:] = self.context.reactive_compact(history, request)
-                    state.has_attempted_reactive_compact = True
+                try:
+                    answer = self.gateway.complete(state=state, **arguments)
+                except Exception as error:
+                    if (
+                        self.gateway.is_prompt_too_long_error(error)
+                        and not state.has_attempted_reactive_compact
+                    ):
+                        history[:] = self.context.reactive_compact(history, request)
+                        state.has_attempted_reactive_compact = True
+                        continue
+                    raise
+                self._check_cancelled()
+                if after_model:
+                    after_model()
+                if answer.stop_reason == "max_tokens" and not state.has_escalated:
+                    max_tokens = self.config.escalated_max_tokens
+                    state.has_escalated = True
                     continue
-                raise
-            if after_model:
-                after_model()
-            if answer.stop_reason == "max_tokens" and not state.has_escalated:
-                max_tokens = self.config.escalated_max_tokens
-                state.has_escalated = True
-                continue
-            content = json_value(answer.content)
-            history.append({"role": "assistant", "content": content})
-            if checkpoint:
-                checkpoint()
-            spoken = extract_text(content)
-            if spoken:
-                self.emit("assistant", {"text": spoken, "scope": scope})
+                content = json_value(answer.content)
+                history.append({"role": "assistant", "content": content})
+                if checkpoint:
+                    checkpoint()
+                spoken = extract_text(content)
+                if spoken:
+                    payload = {"text": spoken, "scope": scope}
+                    if stream_id:
+                        payload["stream_id"] = stream_id
+                    self.emit("assistant", payload)
+            finally:
+                if on_draft:
+                    on_draft(None)
             calls = tool_calls(content)
             if not calls:
                 if (
@@ -121,6 +137,9 @@ class AgentEngine:
                 history[:] = self.context.compact_history(history, request)
             if checkpoint:
                 checkpoint()
+        self._check_cancelled()
+        return extract_text(history[-1].get("content", []))
+
+    def _check_cancelled(self):
         if self.stop_event.is_set():
             raise InterruptedError("Run cancelled")
-        return extract_text(history[-1].get("content", []))

@@ -73,6 +73,7 @@ class HarnessConfig:
     redis_prefix: str = "ayanami"
     redis_cache_ttl: int = 300
     pdf_layout_url: str | None = None
+    cron_service_url: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "workdir", Path(self.workdir).resolve())
@@ -94,6 +95,12 @@ class HarnessConfig:
                     or address.username or address.password or address.query or address.fragment
                     or address.path not in ("", "/")):
                 raise ValueError("PDF_LAYOUT_URL must be a local HTTP base URL")
+        if self.cron_service_url:
+            address = urlsplit(self.cron_service_url)
+            if (address.scheme != "http" or address.hostname not in ("127.0.0.1", "localhost", "::1")
+                    or address.username or address.password or address.query or address.fragment
+                    or address.path not in ("", "/")):
+                raise ValueError("CRON_SERVICE_URL must be a local HTTP base URL")
         if self.vector_backend not in ("qdrant", "milvus"):
             raise ValueError("VECTOR_BACKEND must be qdrant or milvus")
         address = urlsplit(self.milvus_uri)
@@ -161,6 +168,7 @@ class HarnessConfig:
             redis_prefix=os.getenv("REDIS_PREFIX") or "ayanami",
             redis_cache_ttl=int(os.getenv("REDIS_CACHE_TTL") or "300"),
             pdf_layout_url=os.getenv("PDF_LAYOUT_URL") or None,
+            cron_service_url=os.getenv("CRON_SERVICE_URL") or None,
         )
 
 

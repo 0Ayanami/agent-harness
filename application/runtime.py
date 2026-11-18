@@ -10,6 +10,8 @@ from ..config import HarnessConfig
 from ..core.engine import AgentEngine
 from ..core.events import discard_event
 from ..core.hooks import HookRegistry
+from ..core.messages import extract_text
+from ..core.models import RecoveryState
 from ..core.state import BackgroundState, CoordinationState
 from ..infrastructure.mcp import MCPService
 from ..infrastructure.model import ModelGateway
@@ -17,7 +19,7 @@ from ..services.arxiv import import_arxiv_pdf
 from ..services.background import BackgroundTasks
 from ..services.context import ContextService
 from ..services.library import LibraryService
-from ..services.library_rag import LIBRARY_TOOL_NAMES, LibraryRAG, library_options
+from ..services.library_rag import LIBRARY_TOOL_NAMES, NO_EVIDENCE, LibraryRAG, library_options
 from ..services.memory import MemoryStore
 from ..services.permissions import PermissionPolicy
 from ..services.scheduler import Scheduler
@@ -44,6 +46,7 @@ class AgentRuntime:
         memory_lock=None,
         retrieval=None,
         library=None,
+        scheduler=None,
         personalized=True,
         temporary=False,
     ):
@@ -78,7 +81,7 @@ class AgentRuntime:
         self.dispatcher = ToolDispatcher(self.hooks, self.emit, self.cancelled)
         self.background = BackgroundTasks(self.workspace, self.tasks, background_state, self.hooks)
         self.dispatcher.background = self.background
-        self.scheduler = Scheduler(self.state_dir, self.shutdown)
+        self.scheduler = scheduler or Scheduler(self.state_dir, self.shutdown)
         self.team = TeamService(
             config,
             self.state_dir,
@@ -125,8 +128,8 @@ class AgentRuntime:
         return personalized and (not write or not temporary)
 
     def emit(self, kind, payload):
-        # Library drafts and unchecked citation markers stay inside this model turn.
-        # The finished answer is emitted after revalidating its sources.
+        # The tool-enabled evidence pass is private. Only the answer phase can
+        # publish a preview, and only the validated final answer is persisted.
         if self.rag.active and kind == "assistant" and payload.get("scope") != "subagent":
             return
         self._event_sink(kind, payload)
@@ -185,8 +188,8 @@ class AgentRuntime:
             self.emit("background_completed", {"notifications": notes})
         return "\n".join(f"Run scheduled task: {job.prompt}" for job in jobs)
 
-    def _finish_library_answer(self, history, result, checkpoint, *, require_citation=False):
-        payload = self.rag.answer_payload(result, require_citation=require_citation)
+    def _finish_library_answer(self, history, result, checkpoint, *, answer_sources=None, stream_id=None):
+        payload = self.rag.answer_payload(result, answer_sources=answer_sources)
         history.append(
             {"role": "assistant", "content": [{"type": "text", "text": payload["text"]}]}
         )
@@ -198,19 +201,20 @@ class AgentRuntime:
                 "text": payload["text"],
                 "scope": "agent",
                 "run_id": payload["run_id"],
+                **({"stream_id": stream_id} if stream_id else {}),
             },
         )
         self.emit("library_answer", payload)
         return payload["text"]
 
-    def _run_library(self, history, request, options, checkpoint):
+    def _run_library(self, history, request, options, checkpoint, on_draft):
         if not self.rag.begin(request, options):
             return self._finish_library_answer(history, self.rag.unavailable_answer(), checkpoint)
         # A new scope must not inherit tool output or raw document text from a
         # previous question. The user/verified answer and trace events persist;
         # model/tool turns themselves are private to the current question.
         current = [{"role": "user", "content": request}]
-        result = self.engine.run(
+        self.engine.run(
             current,
             request,
             tool_pool=self._tool_pool,
@@ -219,21 +223,61 @@ class AgentRuntime:
             allow_background=False,
         )
         self.rag._check_cancelled()
-        if not result.strip() or current[-1].get("role") != "assistant":
+        if current[-1].get("role") != "assistant" or self.gateway.has_tool_use(current[-1]["content"]):
             return self._finish_library_answer(
                 history,
                 "本轮检索已达到执行预算。请缩小问题范围后重试；暂未生成可验证的资料回答。",
                 checkpoint,
             )
-        return self._finish_library_answer(history, result, checkpoint, require_citation=True)
+        sources = self.rag.answer_sources()
+        if not sources:
+            return self._finish_library_answer(history, NO_EVIDENCE, checkpoint)
+        return self._stream_library_answer(history, request, sources, checkpoint, on_draft)
 
-    def run(self, history, request, checkpoint=None, *, library=None, memory_source=None):
+    def _stream_library_answer(self, history, request, sources, checkpoint, on_draft):
+        stream_id = self.rag.run_id if on_draft else None
+
+        def update_draft(text):
+            self.rag._check_cancelled()
+            preview = self.rag.preview_text(text)
+            on_draft((stream_id, preview) if preview.strip() else None)
+
+        state = RecoveryState(self.config.model)
+        arguments = {
+            "system": self.rag.system_prompt(answer_sources=sources),
+            "messages": [{"role": "user", "content": request}],
+        }
+        if on_draft:
+            arguments["on_text"] = update_draft
+        self.emit("model_started", {"model": state.current_model, "phase": "library_answer"})
+        try:
+            for max_tokens in dict.fromkeys((self.config.max_tokens, self.config.escalated_max_tokens)):
+                self.rag._check_cancelled()
+                answer = self.gateway.complete(state=state, max_tokens=max_tokens, **arguments)
+                self.rag._check_cancelled()
+                if answer.stop_reason != "max_tokens":
+                    break
+            if self.gateway.has_tool_use(answer.content):
+                raise RuntimeError("Unexpected tool call during library answer generation")
+            if answer.stop_reason == "max_tokens":
+                self.rag._warn("回答达到生成长度限制，请缩小问题范围后重试。")
+                result = NO_EVIDENCE
+            else:
+                result = extract_text(answer.content)
+            return self._finish_library_answer(
+                history, result, checkpoint, answer_sources=sources, stream_id=stream_id,
+            )
+        finally:
+            if on_draft:
+                on_draft(None)
+
+    def run(self, history, request, checkpoint=None, *, library=None, memory_source=None, on_draft=None):
         self.hooks.trigger("UserPromptSubmit", request)
         options = library_options(library)
         rag_turn = options is not None
         try:
             if rag_turn:
-                result = self._run_library(history, request, options, checkpoint)
+                result = self._run_library(history, request, options, checkpoint, on_draft)
                 self.hooks.trigger("Stop", history)
                 return result
             result = self.engine.run(
@@ -242,9 +286,12 @@ class AgentRuntime:
                 tool_pool=self._tool_pool,
                 system_prompt=self.system_prompt,
                 before_turn=self.inject_events,
-                after_model=self.acknowledge_scheduled,
+                after_model=None if getattr(self.scheduler, "managed_externally", False) else self.acknowledge_scheduled,
                 checkpoint=checkpoint,
+                on_draft=on_draft,
             )
+            if getattr(self.scheduler, "managed_externally", False):
+                self.acknowledge_scheduled()
             self.hooks.trigger("Stop", history)
             eligible_messages = history if memory_source is None else memory_source
             if (
@@ -287,11 +334,15 @@ class AgentRuntime:
             return bool(self.coordination.active_teammates)
 
     def summary(self):
+        try:
+            crons = self.scheduler.list_jobs()
+        except OSError:
+            crons = []
         return {
             "tasks": [asdict(task) for task in self.tasks.list_tasks()],
             "todos": self.tasks.CURRENT_TODOS,
             "teammates": dict(self.coordination.active_teammates),
-            "crons": self.scheduler.list_jobs(),
+            "crons": crons,
             "memory_catalog": self.memory.read_memory_index() if self._memory_allowed() else "",
         }
 

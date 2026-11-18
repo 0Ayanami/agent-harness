@@ -1,6 +1,8 @@
 """Real HTTP routes, SSE, workers and approvals; only the model is replaced."""
 
 import threading
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -80,6 +82,25 @@ def test_replay_includes_every_page_of_events(web):
     replay = browser.get(f"/api/agent/sessions/{session_id}/events?once=true")
     assert len([line for line in replay.text.splitlines() if line.startswith("data:")]) == 225
     assert '"index": 224' in replay.text
+
+
+def test_interrupted_upstream_stream_does_not_save_partial_assistant_text(web):
+    browser, application, model, session_id = web
+
+    @contextmanager
+    def incomplete_stream(**arguments):
+        yield iter([SimpleNamespace(
+            type="content_block_delta", index=0,
+            delta=SimpleNamespace(type="text_delta", text="unfinished output"),
+        )])
+
+    model.messages.stream = incomplete_stream
+    snapshot = post_message(web, "test interrupted stream")
+    assert snapshot["history"] == [{"role": "user", "content": "test interrupted stream"}]
+    assert application.assistant_draft(session_id) is None
+    replay = browser.get(f"/api/sessions/{session_id}/events?once=true")
+    assert "unfinished output" not in replay.text
+    assert '"outcome": "failed"' in replay.text
 
 
 def test_frontend_alias_uses_same_session_and_permissions(web):
